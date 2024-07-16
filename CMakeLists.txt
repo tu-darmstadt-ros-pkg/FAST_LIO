@@ -5,25 +5,24 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-ADD_COMPILE_OPTIONS(-std=c++14)
-ADD_COMPILE_OPTIONS(-std=c++14)
-set(CMAKE_CXX_FLAGS "-std=c++14 -O3")
-
-add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
-set(CMAKE_CXX_STANDARD 14)
+# Set the C++ standard to C++17
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -pthread -std=c++0x -std=c++14 -fexceptions")
+
+# Add necessary flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pthread -fexceptions")
+
+add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-message("Current CPU archtecture: ${CMAKE_SYSTEM_PROCESSOR}")
+message("Current CPU architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
   include(ProcessorCount)
   ProcessorCount(N)
-  message("Processer number:  ${N}")
+  message("Processor number:  ${N}")
 
   if(N GREATER 4)
     add_definitions(-DMP_EN)
@@ -42,7 +41,7 @@ endif()
 
 find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
 
 find_package(PythonLibs REQUIRED)
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
@@ -76,7 +75,7 @@ set(dependencies
   livox_ros_driver2
 )
 
-# Thirdparty libraries
+# Third-party libraries
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 
