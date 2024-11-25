@@ -44,6 +44,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -58,6 +59,8 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -86,7 +89,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, map_frame, base_frame, lidar_frame;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -136,6 +139,8 @@ MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
+
+Eigen::Affine3d T_base_lidar, T_map_base;
 
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
@@ -284,6 +289,11 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    if (!tf_lookup_done)
+    {
+        // RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF not ready");
+        return;
+    }
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -312,6 +322,12 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
+    if (!tf_lookup_done)
+    {
+        // RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF not ready");
+        return;
+    }
+
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -845,6 +861,9 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.map_frame", "map");
+        this->declare_parameter<string>("common.base_frame", "base_link");
+        this->declare_parameter<string>("common.lidar_frame", "livox_frame");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -883,6 +902,9 @@ public:
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<string>("common.map_frame", map_frame, "map");
+        this->get_parameter<string>("common.base_frame", base_frame);
+        this->get_parameter<string>("common.lidar_frame", lidar_frame);
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -975,10 +997,16 @@ public:
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubDiagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000 / pub_rate)); // Hz to ms
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+        if (!base_frame.empty())
+        {
+            tf_lookup_timer_ = rclcpp::create_timer(this, this->get_clock(), std::chrono::seconds(1), std::bind(&LaserMappingNode::tf_lookup_callback, this));
+        }
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
@@ -1102,6 +1130,15 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            std::cout << "Resulting state_point: " << std::endl << state_point.rot.matrix() << std::endl << state_point.pos << std::endl;
+            // std::cout << "Resulting pos_lid: " << std::endl << pos_lid << std::endl;
+            // Compute transform map to base_link
+            Eigen::Affine3d T_map_lidar = Eigen::Affine3d::Identity();
+            T_map_lidar.translation() << pos_lid(0), pos_lid(1), pos_lid(2);
+            T_map_lidar.linear() = state_point.rot.matrix();
+            Eigen::Affine3d T_map_base = Eigen::Affine3d::Identity();
+
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
@@ -1152,6 +1189,32 @@ private:
         }
     }
 
+    void tf_lookup_callback()
+    {
+        RCLCPP_INFO(this->get_logger(), "tf_lookup_callback");
+        geometry_msgs::msg::TransformStamped t;
+        try {
+            t = tf_buffer_->lookupTransform(
+                lidar_frame, base_frame, tf2::TimePointZero);
+
+            Eigen::Translation3d transl(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z);
+            Eigen::Quaterniond quat(t.transform.rotation.w, t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z);
+            T_base_lidar = transl * quat;
+            std::cout << "T_base_lidar: " << std::endl << T_base_lidar.matrix() << std::endl << std::endl;
+        } catch (const tf2::TransformException & ex) {
+          RCLCPP_INFO(
+            this->get_logger(), "Could not get transform \'%s\' to \'%s\': %s",
+            lidar_frame.c_str(), base_frame.c_str(), ex.what());
+          return;
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(), "Transform %s to %s retrieved!",
+            lidar_frame.c_str(), base_frame.c_str());
+        tf_lookup_done = true;
+        tf_lookup_timer_->cancel();
+    }
+    
     void map_publish_callback()
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
@@ -1194,11 +1257,14 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr tf_lookup_timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
-
+    
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
