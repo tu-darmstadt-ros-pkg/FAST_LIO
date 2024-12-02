@@ -58,7 +58,9 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -71,6 +73,8 @@
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
+
+// TODO gravitiy alignment!
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -89,7 +93,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic, map_frame, base_frame, lidar_frame;
+string map_file_path, lid_topic, imu_topic, map_frame, base_frame, lidar_frame, sensor_init_frame = "sensor_init";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -140,12 +144,11 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
 
-Eigen::Affine3d T_base_lidar, T_map_base;
-
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
+geometry_msgs::msg::TransformStamped T_base_to_sensor;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -289,11 +292,7 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    if (!tf_lookup_done)
-    {
-        // RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF not ready");
-        return;
-    }
+    lidar_frame = msg->header.frame_id;
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -322,11 +321,7 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
-    if (!tf_lookup_done)
-    {
-        // RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF not ready");
-        return;
-    }
+    lidar_frame = msg->header.frame_id;
 
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
@@ -523,7 +518,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = sensor_init_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -575,7 +570,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = lidar_frame;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -592,7 +587,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = sensor_init_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -614,7 +609,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = sensor_init_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -677,44 +672,85 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, 
+                        std::unique_ptr<tf2_ros::Buffer> & tf_buffer,
+                        std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br, 
+                        std::unique_ptr<tf2_ros::StaticTransformBroadcaster> & static_tf_br,
+                        const rclcpp::Logger& logger)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
+    static bool tf_lookup_done = false;
+    if (!tf_lookup_done)
     {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        geometry_msgs::msg::TransformStamped t;
+        try {
+            T_base_to_sensor = tf_buffer->lookupTransform(
+                lidar_frame, base_frame, tf2::TimePointZero);
+        } catch (const tf2::TransformException & ex) {
+            RCLCPP_WARN_ONCE(logger, "Could not get transform %s to %s: %s", lidar_frame.c_str(), base_frame.c_str(), ex.what());
+          return;
+        }
+        RCLCPP_INFO(logger, "Transform %s to %s retrieved!", lidar_frame.c_str(), base_frame.c_str());
+        tf_lookup_done = true;
     }
 
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
-    trans.header.stamp = get_ros_time(lidar_end_time);
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    rclcpp::Time stamp(get_ros_time(lidar_end_time));
+    static bool T_map_to_sensor_init_initialized = false;
+
+    if (!T_map_to_sensor_init_initialized)
+    {
+        // Initialize with T_base_to_sensor
+        static geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
+        T_map_to_sensor_init = T_base_to_sensor;
+        T_map_to_sensor_init.header.frame_id = map_frame;
+        T_map_to_sensor_init.child_frame_id = sensor_init_frame;
+        static_tf_br->sendTransform(T_map_to_sensor_init);
+        T_map_to_sensor_init_initialized = true;
+    }
+
+    // The "result" of FAST LIO is sensor_init to sensor
+    Eigen::Isometry3d eigen_sensor_init_to_sensor;
+    eigen_sensor_init_to_sensor = Eigen::Quaterniond(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+    eigen_sensor_init_to_sensor.translation() = Eigen::Vector3d(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+
+    // We want sensor_init to base
+    Eigen::Isometry3d eg_base_to_sensor = tf2::transformToEigen(T_base_to_sensor.transform);
+    Eigen::Isometry3d eigen_sensor_init_to_base;
+    eigen_sensor_init_to_base.linear() << eigen_sensor_init_to_sensor.linear() * eg_base_to_sensor.linear().inverse();
+    eigen_sensor_init_to_base.translation() << eigen_sensor_init_to_sensor.translation() - eigen_sensor_init_to_base.linear() * eg_base_to_sensor.translation();
+    geometry_msgs::msg::TransformStamped T_sensor_init_to_base = tf2::eigenToTransform(eigen_sensor_init_to_base);
+
+    // Publish sensor_init to base
+    T_sensor_init_to_base.header.frame_id = sensor_init_frame;
+    T_sensor_init_to_base.header.stamp = stamp;
+    T_sensor_init_to_base.child_frame_id = base_frame;
+    tf_br->sendTransform(T_sensor_init_to_base);
+
+    // Publish odometry
+    odomAftMapped.header.frame_id = sensor_init_frame;
+    odomAftMapped.child_frame_id = base_frame;
+    odomAftMapped.header.stamp = stamp;
+    // set_posestamp(odomAftMapped.pose);
+    odomAftMapped.pose.pose = tf2::toMsg(eigen_sensor_init_to_base);
+    pubOdomAftMapped->publish(odomAftMapped);
+    // TODO
+    // auto P = kf.get_P();
+    // for (int i = 0; i < 6; i ++)
+    // {
+    //     int k = i < 3 ? i + 3 : i - 3;
+    //     odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
+    //     odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
+    //     odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
+    //     odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
+    //     odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
+    //     odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+    // }
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = sensor_init_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -931,11 +967,10 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-
-        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
-
+        
+    
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+        path.header.frame_id = sensor_init_frame;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -997,16 +1032,13 @@ public:
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         pubDiagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000 / pub_rate)); // Hz to ms
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
-        if (!base_frame.empty())
-        {
-            tf_lookup_timer_ = rclcpp::create_timer(this, this->get_clock(), std::chrono::seconds(1), std::bind(&LaserMappingNode::tf_lookup_callback, this));
-        }
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
@@ -1033,7 +1065,7 @@ private:
             {
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
-                flg_first_scan = false;
+                flg_first_scan = false;                
                 return;
             }
 
@@ -1130,17 +1162,8 @@ private:
 
             double t_update_end = omp_get_wtime();
 
-            std::cout << "Resulting state_point: " << std::endl << state_point.rot.matrix() << std::endl << state_point.pos << std::endl;
-            // std::cout << "Resulting pos_lid: " << std::endl << pos_lid << std::endl;
-            // Compute transform map to base_link
-            Eigen::Affine3d T_map_lidar = Eigen::Affine3d::Identity();
-            T_map_lidar.translation() << pos_lid(0), pos_lid(1), pos_lid(2);
-            T_map_lidar.linear() = state_point.rot.matrix();
-            Eigen::Affine3d T_map_base = Eigen::Affine3d::Identity();
-
-
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, tf_buffer_, tf_broadcaster_, static_tf_broadcaster_, this->get_logger());
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1188,32 +1211,6 @@ private:
             }
         }
     }
-
-    void tf_lookup_callback()
-    {
-        RCLCPP_INFO(this->get_logger(), "tf_lookup_callback");
-        geometry_msgs::msg::TransformStamped t;
-        try {
-            t = tf_buffer_->lookupTransform(
-                lidar_frame, base_frame, tf2::TimePointZero);
-
-            Eigen::Translation3d transl(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z);
-            Eigen::Quaterniond quat(t.transform.rotation.w, t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z);
-            T_base_lidar = transl * quat;
-            std::cout << "T_base_lidar: " << std::endl << T_base_lidar.matrix() << std::endl << std::endl;
-        } catch (const tf2::TransformException & ex) {
-          RCLCPP_INFO(
-            this->get_logger(), "Could not get transform \'%s\' to \'%s\': %s",
-            lidar_frame.c_str(), base_frame.c_str(), ex.what());
-          return;
-        }
-
-        RCLCPP_INFO(
-            this->get_logger(), "Transform %s to %s retrieved!",
-            lidar_frame.c_str(), base_frame.c_str());
-        tf_lookup_done = true;
-        tf_lookup_timer_->cancel();
-    }
     
     void map_publish_callback()
     {
@@ -1257,10 +1254,10 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr tf_lookup_timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;

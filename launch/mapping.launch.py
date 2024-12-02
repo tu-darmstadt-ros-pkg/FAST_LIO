@@ -48,6 +48,11 @@ def generate_launch_description():
         description='Base frame id. Will be looked up in tf tree'
     )
 
+    declare_map_frame_id_cmd = DeclareLaunchArgument(
+        'map_frame_id', default_value='map',
+        description='Frame id of the map'
+    )
+
     fast_lio_node = Node(
         package='fast_lio',
         executable='fastlio_mapping',
@@ -69,6 +74,7 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
     ld.add_action(declare_base_frame_id_cmd)
+    ld.add_action(declare_map_frame_id_cmd)
 
     ld.add_action(fast_lio_node)
     ld.add_action(rviz_node)
