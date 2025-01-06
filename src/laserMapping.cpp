@@ -48,6 +48,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -73,7 +74,7 @@ double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_ti
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true, diagnostics_en = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -607,6 +608,40 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
+void publish_diagnostics(rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics, double aver_time)
+    {
+        diagnostic_msgs::msg::DiagnosticArray diag_array;
+        diag_array.header.stamp = get_ros_time(lidar_end_time);
+        diag_array.status.resize(1);
+        diag_array.status[0].name = "fast_lio";
+        diag_array.status[0].level = 0; // TODO
+        double pub_period = 1.0 / pub_rate;
+        double percent = aver_time / pub_period;
+
+        // TODO pub_rate is the desired rate, not the actual rate: cannot be higher than lidar input rate
+        if (percent < 0.5)
+        {
+            diag_array.status[0].level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+            diag_array.status[0].message = "Compute time ok (" + std::to_string(percent) + "%)";
+        }
+        else if (percent < 0.8)
+        {
+            diag_array.status[0].level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            diag_array.status[0].message = "Compute time is approaching the publish period (" + std::to_string(percent) + "%)";
+        }
+        else
+        {
+            diag_array.status[0].level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+            diag_array.status[0].message = "Compute time is exceeding the publish period (" + std::to_string(percent) + "%)";
+        }        
+
+        diag_array.status[0].values.resize(1);
+        diag_array.status[0].values[0].key = "aver_time";
+        diag_array.status[0].values[0].value = std::to_string(aver_time);
+
+        pubDiagnostics->publish(diag_array);
+    }
+
 void save_to_pcd()
 {
     pcl::PCDWriter pcd_writer;
@@ -830,6 +865,7 @@ public:
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
+        this->declare_parameter<bool>("diagnostics_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
@@ -867,6 +903,7 @@ public:
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+        this->get_parameter_or<bool>("diagnostics_enable", diagnostics_en, false);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
@@ -936,6 +973,7 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubDiagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -944,6 +982,7 @@ public:
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+        diagnostics_pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&LaserMappingNode::diagnostics_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -1079,7 +1118,7 @@ private:
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
-            if (runtime_pos_log)
+            if (runtime_pos_log || diagnostics_en)
             {
                 frame_num ++;
                 kdtree_size_end = ikdtree.size();
@@ -1101,11 +1140,14 @@ private:
                 s_plot9[time_log_counter] = aver_time_consu;
                 s_plot10[time_log_counter] = add_point_size;
                 time_log_counter ++;
-                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
-                ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-                fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
-                <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
-                dump_lio_state_to_log(fp);
+                if (runtime_pos_log)
+                {
+                    printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
+                    ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+                    fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
+                    <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
+                    dump_lio_state_to_log(fp);
+                }
             }
         }
     }
@@ -1131,6 +1173,14 @@ private:
         }
     }
 
+    void diagnostics_callback()
+    {
+        if (diagnostics_en)
+        {
+            publish_diagnostics(pubDiagnostics_, aver_time_consu);
+        }
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -1138,6 +1188,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -1145,6 +1196,7 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;

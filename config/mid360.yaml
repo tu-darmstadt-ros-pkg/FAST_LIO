@@ -7,10 +7,11 @@
         filter_size_map: 0.5
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
+        diagnostics_enable: true       # publish /diagnostics topic
         map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/livox/lidar"
+            lid_topic:  "/livox/points"
             imu_topic:  "/livox/imu"
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
