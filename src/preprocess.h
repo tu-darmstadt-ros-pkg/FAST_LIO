@@ -16,8 +16,9 @@ enum LID_TYPE
   AVIA = 1,
   VELO16,
   OUST64,
-  MID360
-};  //{1, 2, 3}
+  MID360,
+  AVIA_PC2
+};
 enum TIME_UNIT
 {
   SEC = 0,
@@ -132,6 +133,28 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (uint8_t, line, line)
 )
 
+namespace pcl
+{
+typedef struct {
+  float x;            /**< X axis, Unit:m */
+  float y;            /**< Y axis, Unit:m */
+  float z;            /**< Z axis, Unit:m */
+  uint8_t reflectivity; /**< Reflectivity   */
+  uint8_t tag;        /**< Livox point tag   */
+  uint8_t line;       /**< Laser line id     */
+  uint32_t offset_time;
+} PointXYZRO;
+}
+POINT_CLOUD_REGISTER_POINT_STRUCT(pcl::PointXYZRO,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (uint8_t, reflectivity, reflectivity)
+    (uint8_t, tag, tag)
+    (uint8_t, line, line)
+    (uint32_t, offset_time, offset_time)
+)
+
 class Preprocess
 {
   public:
@@ -156,6 +179,7 @@ class Preprocess
 
 private:
   void avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg);
+  void avia_pc2_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
