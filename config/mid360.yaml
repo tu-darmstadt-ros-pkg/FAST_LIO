@@ -37,6 +37,7 @@
                             0., 0., 1.]
 
         publish:
+            rate: 10                     # Odometry publish rate [Hz, int]. Note that the odometry rate cannot exceed the lidar input rate.
             path_en: true                # true: publish Path
             effect_map_en: false         # true: publish Effects
             map_en: true                 # true: publish Map cloud
