@@ -696,13 +696,31 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     rclcpp::Time stamp(get_ros_time(lidar_end_time));
     static bool T_map_to_sensor_init_initialized = false;
 
-    if (!T_map_to_sensor_init_initialized)
+    if (!T_map_to_sensor_init_initialized && imu_buffer.size() > 5)
     {
+        Vector3d gravity_vec = Vector3d::Zero();
+        std::unique_lock lock(mtx_buffer);
+        for (const auto & imu_msg : imu_buffer) {
+            const auto &ori = imu_msg->orientation;
+            Quaterniond orientation(ori.w, ori.x, ori.y, ori.z);
+            const auto &acc = imu_msg->linear_acceleration;
+            gravity_vec += orientation * Vector3d(acc.x, acc.y, acc.z);
+        }
+        gravity_vec /= imu_buffer.size();
+        lock.unlock();
+        RCLCPP_INFO(logger, "Estimated gravity vector: [%f, %f, %f]", gravity_vec.x(), gravity_vec.y(), gravity_vec.z());
+        Quaterniond q = Quaterniond::FromTwoVectors(gravity_vec, Vector3d(0, 0, 1));
+        RCLCPP_INFO(logger, "Rotation: [%f, %f, %f, %f]", q.w(), q.x(), q.y(), q.z());
+
         // Initialize with T_base_to_sensor
-        static geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
+        geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
         T_map_to_sensor_init = T_base_to_sensor;
         T_map_to_sensor_init.header.frame_id = map_frame;
         T_map_to_sensor_init.child_frame_id = sensor_init_frame;
+        T_map_to_sensor_init.transform.rotation.w = q.w();
+        T_map_to_sensor_init.transform.rotation.x = q.x();
+        T_map_to_sensor_init.transform.rotation.y = q.y();
+        T_map_to_sensor_init.transform.rotation.z = q.z();
         static_tf_br->sendTransform(T_map_to_sensor_init);
         T_map_to_sensor_init_initialized = true;
     }
