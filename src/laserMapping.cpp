@@ -611,7 +611,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
                         std::unique_ptr<tf2_ros::StaticTransformBroadcaster> & static_tf_br,
                         const rclcpp::Logger& logger)
 {
-    RCLCPP_INFO_STREAM(logger, "Base Frame ID: " << base_frame << ", Lidar Frame ID: " << lidar_frame);
+    RCLCPP_INFO_STREAM_ONCE(logger, "Base Frame ID: " << base_frame << ", Lidar Frame ID: " << lidar_frame);
 
     static bool tf_lookup_done = false;
     if (!tf_lookup_done)
