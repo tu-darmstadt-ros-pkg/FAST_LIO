@@ -964,9 +964,9 @@ public:
         fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
         fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
         if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
+            cout << ROOT_DIR<<" file opened" << endl;
         else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+            cout << ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
