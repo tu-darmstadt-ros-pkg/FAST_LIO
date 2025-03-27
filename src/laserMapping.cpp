@@ -301,7 +301,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     static size_t imu_count = 0;
     imu_count++;
     if (imu_count % 500 == 0){
-        std::cout << "IMU msg received (throttled)" << std::endl;
+        std::cout << "imu_count: " << imu_count << std::endl;
     }
     
 
