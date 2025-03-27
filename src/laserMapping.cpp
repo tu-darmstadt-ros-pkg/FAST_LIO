@@ -966,7 +966,7 @@ public:
         if (fout_pre && fout_out)
             cout << ROOT_DIR<<" file opened" << endl;
         else
-            cout << ROOT_DIR<<" doesn't exist" << endl;
+            cout << ROOT_DIR<<" doesn't exist (but you can ignore this)" << endl;
 
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
@@ -977,7 +977,12 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1));
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+                
+        rclcpp::QosOverridingOptions qos_options({rclcpp::QosPolicyKind::Reliability});
+        rclcpp::SubscriptionOptions sub_options;
+        sub_options.qos_overriding_options = qos_options;
+
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sub_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
