@@ -298,6 +298,11 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    static size_t imu_count = 0;
+    imu_count++;
+    if (imu_count % 500 == 0){
+        std::cout << "IMU msg received (throttled)" << std::endl;
+    }
     
 
     msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
@@ -1022,6 +1027,9 @@ private:
         lidar_frame = msg->header.frame_id;
         mtx_buffer.lock();
         scan_count ++;
+        if (scan_count % 50 == 0){
+            std::cout << "scan_count: " << scan_count << std::endl;
+        }
         double cur_time = get_time_sec(msg->header.stamp);
         double preprocess_start_time = omp_get_wtime();
         if (!is_first_lidar && cur_time < last_timestamp_lidar)
