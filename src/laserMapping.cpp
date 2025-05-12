@@ -93,7 +93,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic, map_frame, base_frame, lidar_frame, sensor_init_frame = "odom";
+string map_file_path, lid_topic, imu_topic, map_frame, base_frame, lidar_frame, sensor_init_frame; // = "odom";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -856,6 +856,7 @@ public:
         this->declare_parameter<string>("common.map_frame", "map");
         this->declare_parameter<string>("common.base_frame", "base_link");
         this->declare_parameter<string>("common.lidar_frame", "livox_frame");
+        this->declare_parameter<string>("common.sensor_init_frame", "sensor_init_frame");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -897,8 +898,12 @@ public:
         this->get_parameter_or<string>("common.map_frame", map_frame, "map");
         this->get_parameter<string>("common.base_frame", base_frame);
         this->get_parameter<string>("common.lidar_frame", lidar_frame);
+        this->get_parameter<string>("common.sensor_init_frame", sensor_init_frame);
 
-        RCLCPP_INFO_STREAM(this->get_logger(), "Base Frame ID: " << base_frame << ", Lidar Frame ID: " << lidar_frame);
+        RCLCPP_INFO_STREAM(this->get_logger(), "Base Frame ID: " << base_frame);
+        RCLCPP_INFO_STREAM(this->get_logger(), "Sensor Init Frame ID: " << sensor_init_frame);
+        RCLCPP_INFO_STREAM(this->get_logger(), "Map Frame ID: " << map_frame);
+        RCLCPP_INFO_STREAM(this->get_logger(), "Lidar Frame ID: " << lidar_frame);
 
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
