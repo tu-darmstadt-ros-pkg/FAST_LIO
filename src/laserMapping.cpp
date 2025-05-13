@@ -1040,7 +1040,7 @@ private:
         }
         if (is_first_lidar)
         {
-            std::cout << "first lidar msg received (standard_pcl_cbk)" << std::endl;
+            std::cout << "First lidar msg received (standard_pcl_cbk)" << std::endl;
             is_first_lidar = false;
         }
 
@@ -1069,7 +1069,7 @@ private:
         }
         if(is_first_lidar)
         {
-            std::cout << "first lidar msg received (livox_pcl_cbk)" << std::endl;
+            std::cout << "First lidar msg received (livox_pcl_cbk)" << std::endl;
             is_first_lidar = false;
         }
         last_timestamp_lidar = cur_time;
