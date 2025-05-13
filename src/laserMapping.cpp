@@ -105,7 +105,8 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
-bool    is_first_lidar = true;
+bool   is_first_lidar = true;
+bool   is_first_imu = true;
 int pub_rate;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -296,12 +297,10 @@ bool   timediff_set_flg = false;
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
-    // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    static size_t imu_count = 0;
-    imu_count++;
-    if (imu_count % 500 == 0){
-        std::cout << "imu_count: " << imu_count << std::endl;
+    if (is_first_imu){
+        std::cout << "First IMU msg received" << std::endl;
+        is_first_imu = false;
     }
     
 
@@ -1032,9 +1031,6 @@ private:
         lidar_frame = msg->header.frame_id;
         mtx_buffer.lock();
         scan_count ++;
-        if (scan_count % 50 == 0){
-            std::cout << "scan_count: " << scan_count << std::endl;
-        }
         double cur_time = get_time_sec(msg->header.stamp);
         double preprocess_start_time = omp_get_wtime();
         if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -1044,6 +1040,7 @@ private:
         }
         if (is_first_lidar)
         {
+            std::cout << "first lidar msg received (standard_pcl_cbk)" << std::endl;
             is_first_lidar = false;
         }
 
@@ -1072,6 +1069,7 @@ private:
         }
         if(is_first_lidar)
         {
+            std::cout << "first lidar msg received (livox_pcl_cbk)" << std::endl;
             is_first_lidar = false;
         }
         last_timestamp_lidar = cur_time;
