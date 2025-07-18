@@ -654,6 +654,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         // Initialize with T_base_to_sensor
         geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
         T_map_to_sensor_init = T_base_to_sensor;
+        T_map_to_sensor_init.header.stamp = stamp;
         T_map_to_sensor_init.header.frame_id = map_frame;
         T_map_to_sensor_init.child_frame_id = sensor_init_frame;
         T_map_to_sensor_init.transform.rotation.w = q.w();
