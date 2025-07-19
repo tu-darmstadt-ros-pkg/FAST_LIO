@@ -150,6 +150,7 @@ nav_msgs::msg::Odometry odomAftMapped;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 geometry_msgs::msg::TransformStamped T_base_to_sensor;
+geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -652,17 +653,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         RCLCPP_INFO(logger, "Rotation: [%f, %f, %f, %f]", q.w(), q.x(), q.y(), q.z());
 
         // Initialize with T_base_to_sensor
-        geometry_msgs::msg::TransformStamped T_map_to_sensor_init;
         T_map_to_sensor_init = T_base_to_sensor;
-        T_map_to_sensor_init.header.stamp = stamp;
         T_map_to_sensor_init.header.frame_id = map_frame;
         T_map_to_sensor_init.child_frame_id = sensor_init_frame;
         T_map_to_sensor_init.transform.rotation.w = q.w();
         T_map_to_sensor_init.transform.rotation.x = q.x();
         T_map_to_sensor_init.transform.rotation.y = q.y();
         T_map_to_sensor_init.transform.rotation.z = q.z();
-        static_tf_br->sendTransform(T_map_to_sensor_init);
         T_map_to_sensor_init_initialized = true;
+    }
+    if (T_map_to_sensor_init_initialized)
+    {
+        T_map_to_sensor_init.header.stamp = stamp;
+        tf_br->sendTransform(T_map_to_sensor_init);
     }
 
     // The "result" of FAST LIO is sensor_init to sensor
