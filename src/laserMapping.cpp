@@ -858,6 +858,7 @@ public:
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
+        this->declare_parameter<double>("publish.map_pub_interval", 1.0);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<double>("publish.map_voxelfilter_size", 0.0);
@@ -901,6 +902,7 @@ public:
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+        this->get_parameter_or<double>("publish.map_pub_interval", map_pub_interval, 1.0);
         this->get_parameter_or<double>("publish.map_voxelfilter_size", map_voxel_filter_size, 0.0);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
@@ -1027,7 +1029,7 @@ public:
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000 / pub_rate)); // Hz to ms
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
+        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(map_pub_interval * 1000));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
         diagnostics_pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&LaserMappingNode::diagnostics_callback, this));
 
@@ -1325,7 +1327,7 @@ private:
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
-    double map_voxel_filter_size = 0.5;
+    double map_voxel_filter_size = 0.5, map_pub_interval = 1.0;
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
