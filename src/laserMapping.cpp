@@ -129,6 +129,7 @@ PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
+pcl::VoxelGrid<PointType> mapPubVoxelFilter;
 
 KD_TREE<PointType> ikdtree;
 
@@ -542,8 +543,19 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     }
     *pcl_wait_pub += *laserCloudWorld;
 
+    // Apply additional voxel filter to downsample the map before publishing
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+    if (mapPubVoxelFilter.getLeafSize().x() != 0.0f)
+    {
+        PointCloudXYZI::Ptr pcl_wait_pub_filtered(new PointCloudXYZI());
+        mapPubVoxelFilter.setInputCloud(pcl_wait_pub);
+        mapPubVoxelFilter.filter(*pcl_wait_pub_filtered);
+        pcl::toROSMsg(*pcl_wait_pub_filtered, laserCloudmsg);
+    }
+    else
+    {
+        pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+    }
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = sensor_init_frame;
@@ -848,6 +860,7 @@ public:
         this->declare_parameter<bool>("publish.map_en", false);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
+        this->declare_parameter<double>("publish.map_voxelfilter_size", 0.0);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
@@ -888,6 +901,7 @@ public:
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+        this->get_parameter_or<double>("publish.map_voxelfilter_size", map_voxel_filter_size, 0.0);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
@@ -899,7 +913,10 @@ public:
         this->get_parameter<string>("common.base_frame", base_frame);
         this->get_parameter<string>("common.lidar_frame", lidar_frame);
         this->get_parameter<string>("common.sensor_init_frame", sensor_init_frame);
-
+        if (map_voxel_filter_size == 0.0)
+            RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing is disabled");
+        else
+            RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing has leaf size: " << map_voxel_filter_size << std::endl);
         RCLCPP_INFO_STREAM(this->get_logger(), "Base Frame ID: " << base_frame);
         RCLCPP_INFO_STREAM(this->get_logger(), "Sensor Init Frame ID: " << sensor_init_frame);
         RCLCPP_INFO_STREAM(this->get_logger(), "Map Frame ID: " << map_frame);
@@ -950,6 +967,7 @@ public:
         memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+        mapPubVoxelFilter.setLeafSize(map_voxel_filter_size, map_voxel_filter_size, map_voxel_filter_size);
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
 
@@ -1307,6 +1325,7 @@ private:
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
+    double map_voxel_filter_size = 0.5;
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
