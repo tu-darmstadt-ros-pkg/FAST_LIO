@@ -545,7 +545,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 
     // Apply additional voxel filter to downsample the map before publishing
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    if (mapPubVoxelFilter.getLeafSize().x() != 0.0f)
+    if (mapPubVoxelFilter.getLeafSize().x() > 0.0f)
     {
         PointCloudXYZI::Ptr pcl_wait_pub_filtered(new PointCloudXYZI());
         mapPubVoxelFilter.setInputCloud(pcl_wait_pub);
@@ -915,7 +915,7 @@ public:
         this->get_parameter<string>("common.base_frame", base_frame);
         this->get_parameter<string>("common.lidar_frame", lidar_frame);
         this->get_parameter<string>("common.sensor_init_frame", sensor_init_frame);
-        if (map_voxel_filter_size == 0.0)
+        if (map_voxel_filter_size <= 0.0)
             RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing is disabled");
         else
             RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing has leaf size: " << map_voxel_filter_size << std::endl);
