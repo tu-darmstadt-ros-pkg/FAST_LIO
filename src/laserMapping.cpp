@@ -68,6 +68,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <filesystem>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -1279,12 +1280,28 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
+        std::string abs_path = map_file_path;
+        if (!map_file_path.empty())
+        {
+            try {
+                abs_path = std::filesystem::absolute(map_file_path).lexically_normal().string();
+            } catch(const std::exception &e) {
+                RCLCPP_WARN(this->get_logger(), "Failed to resolve absolute map path '%s': %s. Using original path.", map_file_path.c_str(), e.what());
+            }
+        }
+        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", abs_path.c_str());
         if (pcd_save_en)
         {
             save_to_pcd();
             res->success = true;
-            res->message = "Map saved.";
+            if (map_file_path.empty())
+            {
+                res->message = "Map save path is not set.";
+            }
+            else
+            {
+                res->message = "Map saved to " + abs_path + ".";
+            }
         }
         else
         {
