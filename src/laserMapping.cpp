@@ -108,6 +108,7 @@ bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   is_first_lidar = true;
 bool   is_first_imu = true;
+bool   new_lidar_frame = false;
 int pub_rate;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -542,7 +543,12 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    *pcl_wait_pub += *laserCloudWorld;
+
+    // Only add laserCloudWorld points when it has actually changed, otherwise the map grows infinitely
+    if (new_lidar_frame)
+    {
+        *pcl_wait_pub += *laserCloudWorld;
+    }
 
     // Apply additional voxel filter to downsample the map before publishing
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
@@ -561,6 +567,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = sensor_init_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
+    new_lidar_frame = false;
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
     // pcl::toROSMsg(*featsFromMap, laserCloudMap);
@@ -1051,6 +1058,7 @@ private:
     void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         lidar_frame = msg->header.frame_id;
+        new_lidar_frame = true;
         mtx_buffer.lock();
         scan_count ++;
         double cur_time = get_time_sec(msg->header.stamp);
@@ -1079,6 +1087,7 @@ private:
     void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         lidar_frame = msg->header.frame_id;
+        new_lidar_frame = true;
 
         mtx_buffer.lock();
         double cur_time = get_time_sec(msg->header.stamp);
