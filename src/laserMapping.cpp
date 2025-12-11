@@ -109,6 +109,7 @@ bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   is_first_lidar = true;
 bool   is_first_imu = true;
 bool   new_lidar_frame = false;
+bool   base_frame_set_dynamically = false;
 int pub_rate;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -876,7 +877,7 @@ public:
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<string>("common.map_frame", "map");
-        this->declare_parameter<string>("common.base_frame", "base_link");
+        this->declare_parameter<string>("common.base_frame", "");
         this->declare_parameter<string>("common.lidar_frame", "livox_frame");
         this->declare_parameter<string>("common.sensor_init_frame", "sensor_init_frame");
         this->declare_parameter<bool>("common.time_sync_en", false);
@@ -920,14 +921,17 @@ public:
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<string>("common.map_frame", map_frame, "map");
-        this->get_parameter<string>("common.base_frame", base_frame);
+        this->get_parameter_or<string>("common.base_frame", base_frame, "");
         this->get_parameter<string>("common.lidar_frame", lidar_frame);
         this->get_parameter<string>("common.sensor_init_frame", sensor_init_frame);
         if (map_voxel_filter_size <= 0.0)
             RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing is disabled");
         else
             RCLCPP_INFO_STREAM(this->get_logger(), "Map voxel filter for publishing has leaf size: " << map_voxel_filter_size << std::endl);
-        RCLCPP_INFO_STREAM(this->get_logger(), "Base Frame ID: " << base_frame);
+        if (base_frame.empty())
+            RCLCPP_INFO(this->get_logger(), "Base Frame ID will be set dynamically from first lidar message");
+        else
+            RCLCPP_INFO_STREAM(this->get_logger(), "Base Frame ID: " << base_frame);
         RCLCPP_INFO_STREAM(this->get_logger(), "Sensor Init Frame ID: " << sensor_init_frame);
         RCLCPP_INFO_STREAM(this->get_logger(), "Map Frame ID: " << map_frame);
         RCLCPP_INFO_STREAM(this->get_logger(), "Lidar Frame ID: " << lidar_frame);
@@ -1071,6 +1075,12 @@ private:
         if (is_first_lidar)
         {
             std::cout << "First lidar msg received (standard_pcl_cbk)" << std::endl;
+            if (base_frame.empty() && !base_frame_set_dynamically)
+            {
+                base_frame = msg->header.frame_id;
+                base_frame_set_dynamically = true;
+                RCLCPP_INFO(this->get_logger(), "Base Frame ID dynamically set to: %s", base_frame.c_str());
+            }
             is_first_lidar = false;
         }
 
@@ -1101,6 +1111,12 @@ private:
         if(is_first_lidar)
         {
             std::cout << "First lidar msg received (livox_pcl_cbk)" << std::endl;
+            if (base_frame.empty() && !base_frame_set_dynamically)
+            {
+                base_frame = msg->header.frame_id;
+                base_frame_set_dynamically = true;
+                RCLCPP_INFO(this->get_logger(), "Base Frame ID dynamically set to: %s", base_frame.c_str());
+            }
             is_first_lidar = false;
         }
         last_timestamp_lidar = cur_time;
