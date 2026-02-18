@@ -112,9 +112,6 @@ bool   is_first_imu = true;
 int    imu_msg_count = 0;
 int    lidar_msg_count = 0;
 int    lidar2_msg_count = 0;
-double total_distance = 0.0;
-V3D    last_position(Zero3d);
-bool   has_last_position = false;
 bool   new_lidar_frame = false;
 bool   base_frame_set_dynamically = false;
 int pub_rate;
@@ -1692,23 +1689,6 @@ private:
 
             double t_update_end = omp_get_wtime();
 
-            /*** Track distance traveled ***/
-            V3D cur_pos(state_point.pos(0), state_point.pos(1), state_point.pos(2));
-            if (has_last_position)
-            {
-                double step = (cur_pos - last_position).norm();
-                if (step >= 0.05) // ignore noise below 5cm
-                {
-                    total_distance += step;
-                    last_position = cur_pos;
-                }
-            }
-            else
-            {
-                last_position = cur_pos;
-                has_last_position = true;
-            }
-
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_buffer_, tf_broadcaster_, static_tf_broadcaster_, this->get_logger());
 
@@ -1854,7 +1834,6 @@ private:
         std::cout << "Position    [xyz]  :: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << std::endl;
         V3D euler = SO3ToEuler(state_point.rot);
         std::cout << "Orientation [rpy]  :: " << euler(0) << " " << euler(1) << " " << euler(2) << std::endl;
-        std::cout << "Distance Traveled  :: " << total_distance << " m" << std::endl;
         std::cout << "Distance to Origin :: " << dist_to_origin << " m" << std::endl;
         std::cout << std::endl;
         std::cout << std::right << std::setprecision(2) << std::fixed;
