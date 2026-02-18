@@ -183,6 +183,9 @@ vector<double>       extrinR2(9, 0.0);
 vector<double>       extrinT_L2_wrt_L1(3, 0.0);
 vector<double>       extrinR_L2_wrt_L1(9, 0.0);
 bool   extrinsic_imu_to_lidars = false;
+bool   l2_extrinsic_from_tf = false;
+bool   l2_extrinsic_resolved = false;
+string lidar_frame2;
 V3D Lidar2_T_wrt_L1(Zero3d);
 M3D Lidar2_R_wrt_L1(Eye3d);
 shared_ptr<Preprocess> p_pre2(new Preprocess());
@@ -1311,10 +1314,16 @@ public:
             }
             else
             {
-                RCLCPP_WARN(this->get_logger(), "Multi-LiDAR enabled but no L2 extrinsic provided! Using identity.");
+                // No config extrinsic provided — will try TF lookup at runtime
+                l2_extrinsic_from_tf = true;
+                RCLCPP_INFO(this->get_logger(), "Multi-LiDAR: no L2 extrinsic in config, will look up from TF (L1 frame -> L2 frame)");
             }
-            RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 translation: " << Lidar2_T_wrt_L1.transpose());
-            RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 rotation:\n" << Lidar2_R_wrt_L1);
+            if (!l2_extrinsic_from_tf)
+            {
+                l2_extrinsic_resolved = true;
+                RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 translation: " << Lidar2_T_wrt_L1.transpose());
+                RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 rotation:\n" << Lidar2_R_wrt_L1);
+            }
         }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -1501,6 +1510,7 @@ private:
         if (is_first_lidar2)
         {
             std::cout << "First lidar2 msg received (standard_pcl_cbk2)" << std::endl;
+            lidar_frame2 = msg->header.frame_id;
             is_first_lidar2 = false;
         }
 
@@ -1526,6 +1536,7 @@ private:
         if (is_first_lidar2)
         {
             std::cout << "First lidar2 msg received (livox_pcl_cbk2)" << std::endl;
+            lidar_frame2 = msg->header.frame_id;
             is_first_lidar2 = false;
         }
         last_timestamp_lidar2 = cur_time;
@@ -1551,6 +1562,33 @@ private:
         }
         if (!synced) break;
         {
+            /*** TF-based L2 extrinsic lookup (once, when frame IDs are available) ***/
+            if (multi_lidar && l2_extrinsic_from_tf && !l2_extrinsic_resolved)
+            {
+                if (lidar_frame.empty() || lidar_frame2.empty())
+                {
+                    RCLCPP_WARN_ONCE(this->get_logger(), "Waiting for both lidar frame IDs before TF lookup...");
+                    break; // can't process yet
+                }
+                try {
+                    auto T_L1_to_L2 = tf_buffer_->lookupTransform(
+                            lidar_frame, lidar_frame2, tf2::TimePointZero);
+                    Eigen::Isometry3d eigen_tf = tf2::transformToEigen(T_L1_to_L2.transform);
+                    Lidar2_R_wrt_L1 = eigen_tf.rotation();
+                    Lidar2_T_wrt_L1 = eigen_tf.translation();
+                    l2_extrinsic_resolved = true;
+                    RCLCPP_INFO(this->get_logger(), "L2 extrinsic from TF (%s -> %s) resolved!",
+                                lidar_frame.c_str(), lidar_frame2.c_str());
+                    RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 translation: " << Lidar2_T_wrt_L1.transpose());
+                    RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 rotation:\n" << Lidar2_R_wrt_L1);
+                } catch (const tf2::TransformException &ex) {
+                    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                        "L2 extrinsic not in config and TF %s -> %s not available: %s. "
+                        "Provide extrinsic_T_L2_wrt_L1/extrinsic_R_L2_wrt_L1 in config or publish the TF.",
+                        lidar_frame.c_str(), lidar_frame2.c_str(), ex.what());
+                    break; // skip this scan, keep trying next tick
+                }
+            }
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
