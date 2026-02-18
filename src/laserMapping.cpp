@@ -167,6 +167,8 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 /*** Multi-LiDAR variables ***/
 bool   multi_lidar = false;
+int    update_mode = 0;    // 0=bundle, 1=async
+int    last_async_lidar = 0;  // which lidar was last processed in async mode (1 or 2)
 string lid_topic2;
 double last_timestamp_lidar2 = 0;
 bool   is_first_lidar2 = true;
@@ -511,6 +513,137 @@ bool sync_packages_multi(MeasureGroup &meas)
     lidar_pushed = false;
     lidar_pushed2 = false;
     return true;
+}
+
+/*** Multi-LiDAR async sync: processes whichever lidar scan is available (oldest first) ***/
+bool sync_packages_async(MeasureGroup &meas)
+{
+    if (imu_buffer.empty()) return false;
+
+    // Determine which lidar to process
+    bool process_l1 = lidar_pushed;   // Continue L1 if already started
+    bool process_l2 = lidar_pushed2;  // Continue L2 if already started
+
+    if (!process_l1 && !process_l2)
+    {
+        bool l1_ready = !lidar_buffer.empty();
+        bool l2_ready = !lidar_buffer2.empty();
+        if (!l1_ready && !l2_ready) return false;
+
+        if (l1_ready && l2_ready)
+            process_l1 = (time_buffer.front() <= time_buffer2.front());
+        else
+            process_l1 = l1_ready;
+        process_l2 = !process_l1;
+    }
+
+    if (process_l1)
+    {
+        if (lidar_buffer.empty()) return false;
+
+        /*** push lidar 1 scan ***/
+        if (!lidar_pushed)
+        {
+            meas.lidar = lidar_buffer.front();
+            meas.lidar_beg_time = time_buffer.front();
+            if (meas.lidar->points.size() <= 1)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+                std::cerr << "Too few input point cloud (L1 async)!\n";
+            }
+            else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            }
+            else
+            {
+                scan_num++;
+                lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+                lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            }
+            meas.lidar_end_time = lidar_end_time;
+            lidar_pushed = true;
+        }
+
+        if (last_timestamp_imu < lidar_end_time) return false;
+
+        /*** push imu data ***/
+        double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+        meas.imu.clear();
+        while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+        {
+            imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+            if (imu_time > lidar_end_time) break;
+            meas.imu.push_back(imu_buffer.front());
+            imu_buffer.pop_front();
+        }
+
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        lidar_pushed = false;
+        last_async_lidar = 1;
+        return true;
+    }
+    else // process_l2
+    {
+        if (lidar_buffer2.empty()) return false;
+
+        /*** push lidar 2 scan: transform to L1 frame, treat as primary ***/
+        if (!lidar_pushed2)
+        {
+            meas.lidar_beg_time = time_buffer2.front();
+
+            // Copy and transform L2 cloud to L1 frame
+            PointCloudXYZI::Ptr cloud2(new PointCloudXYZI(*lidar_buffer2.front()));
+            for (size_t i = 0; i < cloud2->points.size(); i++)
+            {
+                auto &pt = cloud2->points[i];
+                V3D p_L2(pt.x, pt.y, pt.z);
+                V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
+                pt.x = p_L1(0);
+                pt.y = p_L1(1);
+                pt.z = p_L1(2);
+            }
+            meas.lidar = cloud2;
+
+            if (meas.lidar->points.size() <= 1)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime2;
+                std::cerr << "Too few input point cloud (L2 async)!\n";
+            }
+            else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime2)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime2;
+            }
+            else
+            {
+                scan_num2++;
+                lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+                lidar_mean_scantime2 += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime2) / scan_num2;
+            }
+            meas.lidar_end_time = lidar_end_time;
+            lidar_pushed2 = true;
+        }
+
+        if (last_timestamp_imu < lidar_end_time) return false;
+
+        /*** push imu data ***/
+        double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+        meas.imu.clear();
+        while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+        {
+            imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+            if (imu_time > lidar_end_time) break;
+            meas.imu.push_back(imu_buffer.front());
+            imu_buffer.pop_front();
+        }
+
+        lidar_buffer2.pop_front();
+        time_buffer2.pop_front();
+        lidar_pushed2 = false;
+        last_async_lidar = 2;
+        return true;
+    }
 }
 
 int process_increments = 0;
@@ -1034,6 +1167,7 @@ public:
 
         /*** Multi-LiDAR parameter declarations ***/
         this->declare_parameter<bool>("common.multi_lidar", false);
+        this->declare_parameter<int>("common.update_mode", 0);
         this->declare_parameter<string>("common.lid_topic2", "/livox/lidar2");
         this->declare_parameter<int>("preprocess.lidar_type2", AVIA);
         this->declare_parameter<int>("preprocess.scan_line2", 16);
@@ -1105,6 +1239,7 @@ public:
 
         /*** Multi-LiDAR parameter reads ***/
         this->get_parameter_or<bool>("common.multi_lidar", multi_lidar, false);
+        this->get_parameter_or<int>("common.update_mode", update_mode, 0);
         this->get_parameter_or<string>("common.lid_topic2", lid_topic2, "/livox/lidar2");
         int lidar_type2 = AVIA;
         this->get_parameter_or<int>("preprocess.lidar_type2", lidar_type2, AVIA);
@@ -1120,7 +1255,8 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2_wrt_L1, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2_wrt_L1, vector<double>());
         if (multi_lidar)
-            RCLCPP_INFO(this->get_logger(), "Multi-LiDAR mode ENABLED. L1: %s, L2: %s", lid_topic.c_str(), lid_topic2.c_str());
+            RCLCPP_INFO(this->get_logger(), "Multi-LiDAR mode ENABLED (%s). L1: %s, L2: %s",
+                        update_mode == 1 ? "ASYNC" : "BUNDLE", lid_topic.c_str(), lid_topic2.c_str());
         else
             RCLCPP_INFO(this->get_logger(), "Single-LiDAR mode. Topic: %s", lid_topic.c_str());
         
@@ -1404,7 +1540,16 @@ private:
 
     void timer_callback()
     {
-        if(multi_lidar ? sync_packages_multi(Measures) : sync_packages(Measures))
+      bool keep_processing = true;
+      while (keep_processing)
+      {
+        bool synced = false;
+        if (multi_lidar) {
+            synced = (update_mode == 1) ? sync_packages_async(Measures) : sync_packages_multi(Measures);
+        } else {
+            synced = sync_packages(Measures);
+        }
+        if (!synced) break;
         {
             if (flg_first_scan)
             {
@@ -1423,7 +1568,9 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
-            p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
+            // In async mode, each lidar is processed individually (no multi undistort needed)
+            bool use_multi_undistort = multi_lidar && (update_mode == 0);
+            p_imu->Process(Measures, kf, feats_undistort, use_multi_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1575,6 +1722,9 @@ private:
                 }
             }
         }
+        // In async mode, loop to process all pending scans; otherwise one scan per tick
+        if (!multi_lidar || update_mode != 1) keep_processing = false;
+      } // while (keep_processing)
     }
     
     void map_publish_callback()
@@ -1660,7 +1810,8 @@ private:
         // Clear terminal and print status
         printf("\033[2J\033[1;1H");
         std::cout << std::endl;
-        std::cout << "==== FAST-LIO" << (multi_lidar ? " MULTI" : "") << " ====" << std::endl;
+        std::string mode_str = multi_lidar ? (update_mode == 1 ? " ASYNC" : " BUNDLE") : "";
+        std::cout << "==== FAST-LIO" << mode_str << " ====" << std::endl;
         std::cout << std::endl << std::setprecision(4) << std::fixed;
         std::cout << "Position    [xyz]  :: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << std::endl;
         V3D euler = SO3ToEuler(state_point.rot);
@@ -1673,7 +1824,12 @@ private:
         std::cout << "  IMU    [" << imu_topic << "] :: " << imu_msg_count << std::endl;
         std::cout << "  LiDAR1 [" << lid_topic << "] :: " << lidar_msg_count << std::endl;
         if (multi_lidar)
+        {
             std::cout << "  LiDAR2 [" << lid_topic2 << "] :: " << lidar2_msg_count << std::endl;
+            if (update_mode == 1)
+                std::cout << "  Last Async   :: L" << last_async_lidar
+                          << "  (buf: L1=" << lidar_buffer.size() << " L2=" << lidar_buffer2.size() << ")" << std::endl;
+        }
         std::cout << std::endl;
         std::cout << "--- Performance ---" << std::endl;
         std::cout << "  Frame Time    :: " << std::setfill(' ') << std::setw(7) << frame_time * 1000.0 << " ms" << std::endl;

@@ -13,8 +13,9 @@
 
         common:
             multi_lidar: true                # false: single-LiDAR with the first LiDAR topic/extrinsic
+            update_mode: 1                   # 0: bundle (wait for both lidars), 1: async (process each independently)
             lid_topic:  "/ec_swift/front_lidar/points_raw_livox"
-            lid_topic2: "/ec_swift/back_lidar/points_raw_livox"
+            lid_topic2: "/back"
             imu_topic:  "/ec_swift/front_lidar/imu"
             map_frame:  "map"
             base_frame: "base_link"
