@@ -1697,7 +1697,7 @@ private:
             if (has_last_position)
             {
                 double step = (cur_pos - last_position).norm();
-                if (step >= 0.01) // ignore noise below 1cm
+                if (step >= 0.05) // ignore noise below 5cm
                 {
                     total_distance += step;
                     last_position = cur_pos;
