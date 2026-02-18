@@ -69,6 +69,7 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 #include <filesystem>
+#include <numeric>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -100,7 +101,7 @@ double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
-double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
+double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
@@ -108,6 +109,12 @@ bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   is_first_lidar = true;
 bool   is_first_imu = true;
+int    imu_msg_count = 0;
+int    lidar_msg_count = 0;
+int    lidar2_msg_count = 0;
+double total_distance = 0.0;
+V3D    last_position(Zero3d);
+bool   has_last_position = false;
 bool   new_lidar_frame = false;
 bool   base_frame_set_dynamically = false;
 int pub_rate;
@@ -157,6 +164,26 @@ geometry_msgs::msg::TransformStamped T_base_to_sensor;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+/*** Multi-LiDAR variables ***/
+bool   multi_lidar = false;
+string lid_topic2;
+double last_timestamp_lidar2 = 0;
+bool   is_first_lidar2 = true;
+double lidar_end_time2 = 0;
+bool   lidar_pushed2 = false;
+double lidar_mean_scantime2 = 0.0;
+int    scan_num2 = 0;
+deque<double>                     time_buffer2;
+deque<PointCloudXYZI::Ptr>        lidar_buffer2;
+vector<double>       extrinT2(3, 0.0);
+vector<double>       extrinR2(9, 0.0);
+vector<double>       extrinT_L2_wrt_L1(3, 0.0);
+vector<double>       extrinR_L2_wrt_L1(9, 0.0);
+bool   extrinsic_imu_to_lidars = false;
+V3D Lidar2_T_wrt_L1(Zero3d);
+M3D Lidar2_R_wrt_L1(Eye3d);
+shared_ptr<Preprocess> p_pre2(new Preprocess());
 
 void SigHandle(int sig)
 {
@@ -301,6 +328,7 @@ bool   timediff_set_flg = false;
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
+    imu_msg_count ++;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
     if (is_first_imu){
         std::cout << "First IMU msg received" << std::endl;
@@ -385,6 +413,103 @@ bool sync_packages(MeasureGroup &meas)
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+    return true;
+}
+
+/*** Multi-LiDAR bundle sync: waits for both lidar scans before packaging ***/
+bool sync_packages_multi(MeasureGroup &meas)
+{
+    if (!lidar_pushed || !lidar_pushed2)
+    {
+        if (lidar_buffer.empty() || lidar_buffer2.empty() || imu_buffer.empty())
+            return false;
+    }
+    if (imu_buffer.empty()) return false;
+
+    /*** push lidar 1 scan ***/
+    if(!lidar_pushed)
+    {
+        meas.lidar = lidar_buffer.front();
+        meas.lidar_beg_time = time_buffer.front();
+        if (meas.lidar->points.size() <= 1)
+        {
+            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            std::cerr << "Too few input point cloud (L1)!\n";
+        }
+        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
+        {
+            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+        }
+        else
+        {
+            scan_num ++;
+            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+        }
+        meas.lidar_end_time = lidar_end_time;
+        lidar_pushed = true;
+    }
+
+    /*** push lidar 2 scan ***/
+    if(!lidar_pushed2)
+    {
+        meas.lidar2 = lidar_buffer2.front();
+        meas.lidar_beg_time2 = time_buffer2.front();
+        if (meas.lidar2->points.size() <= 1)
+        {
+            lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
+            std::cerr << "Too few input point cloud (L2)!\n";
+        }
+        else if (meas.lidar2->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime2)
+        {
+            lidar_end_time2 = meas.lidar_beg_time2 + lidar_mean_scantime2;
+        }
+        else
+        {
+            scan_num2 ++;
+            lidar_end_time2 = meas.lidar_beg_time2 + meas.lidar2->points.back().curvature / double(1000);
+            lidar_mean_scantime2 += (meas.lidar2->points.back().curvature / double(1000) - lidar_mean_scantime2) / scan_num2;
+        }
+        meas.lidar_end_time2 = lidar_end_time2;
+
+        /*** Transform L2 points to L1 frame using L2-wrt-L1 extrinsic ***/
+        for (size_t i = 0; i < meas.lidar2->points.size(); i++)
+        {
+            auto &pt = meas.lidar2->points[i];
+            V3D p_L2(pt.x, pt.y, pt.z);
+            V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
+            pt.x = p_L1(0);
+            pt.y = p_L1(1);
+            pt.z = p_L1(2);
+        }
+
+        lidar_pushed2 = true;
+    }
+
+    double combined_end_time = max(lidar_end_time, lidar_end_time2);
+
+    if (last_timestamp_imu < combined_end_time)
+    {
+        return false;
+    }
+
+    /*** push imu data, and pop from imu buffer ***/
+    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+    meas.imu.clear();
+    while ((!imu_buffer.empty()) && (imu_time < combined_end_time))
+    {
+        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+        if(imu_time > combined_end_time) break;
+        meas.imu.push_back(imu_buffer.front());
+        imu_buffer.pop_front();
+    }
+
+    lidar_buffer.pop_front();
+    time_buffer.pop_front();
+    lidar_buffer2.pop_front();
+    time_buffer2.pop_front();
+    lidar_pushed = false;
+    lidar_pushed2 = false;
     return true;
 }
 
@@ -907,6 +1032,21 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
+        /*** Multi-LiDAR parameter declarations ***/
+        this->declare_parameter<bool>("common.multi_lidar", false);
+        this->declare_parameter<string>("common.lid_topic2", "/livox/lidar2");
+        this->declare_parameter<int>("preprocess.lidar_type2", AVIA);
+        this->declare_parameter<int>("preprocess.scan_line2", 16);
+        this->declare_parameter<int>("preprocess.timestamp_unit2", US);
+        this->declare_parameter<int>("preprocess.scan_rate2", 10);
+        this->declare_parameter<double>("preprocess.blind2", 0.01);
+        this->declare_parameter<int>("point_filter_num2", 2);
+        this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", false);
+        this->declare_parameter<vector<double>>("mapping.extrinsic_T2", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.extrinsic_R2", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.extrinsic_T_L2_wrt_L1", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.extrinsic_R_L2_wrt_L1", vector<double>());
+
         this->get_parameter_or<int>("publish.rate", pub_rate, 10);
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -962,6 +1102,27 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+
+        /*** Multi-LiDAR parameter reads ***/
+        this->get_parameter_or<bool>("common.multi_lidar", multi_lidar, false);
+        this->get_parameter_or<string>("common.lid_topic2", lid_topic2, "/livox/lidar2");
+        int lidar_type2 = AVIA;
+        this->get_parameter_or<int>("preprocess.lidar_type2", lidar_type2, AVIA);
+        this->get_parameter_or<int>("preprocess.scan_line2", p_pre2->N_SCANS, 16);
+        this->get_parameter_or<int>("preprocess.timestamp_unit2", p_pre2->time_unit, US);
+        this->get_parameter_or<int>("preprocess.scan_rate2", p_pre2->SCAN_RATE, 10);
+        this->get_parameter_or<double>("preprocess.blind2", p_pre2->blind, 0.01);
+        this->get_parameter_or<int>("point_filter_num2", p_pre2->point_filter_num, 2);
+        p_pre2->lidar_type = lidar_type2;
+        this->get_parameter_or<bool>("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, false);
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_T2", extrinT2, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_R2", extrinR2, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2_wrt_L1, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2_wrt_L1, vector<double>());
+        if (multi_lidar)
+            RCLCPP_INFO(this->get_logger(), "Multi-LiDAR mode ENABLED. L1: %s, L2: %s", lid_topic.c_str(), lid_topic2.c_str());
+        else
+            RCLCPP_INFO(this->get_logger(), "Single-LiDAR mode. Topic: %s", lid_topic.c_str());
         
     
         path.header.stamp = this->get_clock()->now();
@@ -985,9 +1146,40 @@ public:
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
 
+        if (extrinT.size() < 3) extrinT = {0.0, 0.0, 0.0};
+        if (extrinR.size() < 9) extrinR = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+
+        /*** Compute L2 wrt L1 extrinsic ***/
+        if (multi_lidar)
+        {
+            if (extrinsic_imu_to_lidars && extrinT2.size() >= 3 && extrinR2.size() >= 9)
+            {
+                // User provides IMU-to-L2 extrinsic, compute L2 wrt L1
+                V3D T_L2_I;
+                M3D R_L2_I;
+                T_L2_I << VEC_FROM_ARRAY(extrinT2);
+                R_L2_I << MAT_FROM_ARRAY(extrinR2);
+                Lidar2_R_wrt_L1 = Lidar_R_wrt_IMU.transpose() * R_L2_I;
+                Lidar2_T_wrt_L1 = Lidar_R_wrt_IMU.transpose() * (T_L2_I - Lidar_T_wrt_IMU);
+                RCLCPP_INFO(this->get_logger(), "L2 extrinsic computed from IMU-to-L2 extrinsic");
+            }
+            else if (extrinT_L2_wrt_L1.size() >= 3 && extrinR_L2_wrt_L1.size() >= 9)
+            {
+                // User provides L2 wrt L1 directly
+                Lidar2_T_wrt_L1 << VEC_FROM_ARRAY(extrinT_L2_wrt_L1);
+                Lidar2_R_wrt_L1 << MAT_FROM_ARRAY(extrinR_L2_wrt_L1);
+                RCLCPP_INFO(this->get_logger(), "L2 extrinsic loaded from L2-wrt-L1 parameters");
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(), "Multi-LiDAR enabled but no L2 extrinsic provided! Using identity.");
+            }
+            RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 translation: " << Lidar2_T_wrt_L1.transpose());
+            RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 rotation:\n" << Lidar2_R_wrt_L1);
+        }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
@@ -1018,6 +1210,20 @@ public:
         else
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1));
+        }
+
+        /*** Second LiDAR subscriber (if multi-lidar enabled) ***/
+        if (multi_lidar)
+        {
+            if (p_pre2->lidar_type == AVIA)
+            {
+                sub_pcl_livox2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic2, 20, std::bind(&LaserMappingNode::livox_pcl_cbk2, this, std::placeholders::_1));
+            }
+            else
+            {
+                sub_pcl_pc2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic2, rclcpp::SensorDataQoS(), std::bind(&LaserMappingNode::standard_pcl_cbk2, this, std::placeholders::_1));
+            }
+            RCLCPP_INFO(this->get_logger(), "Second LiDAR subscriber created for topic: %s", lid_topic2.c_str());
         }
                 
         rclcpp::QosOverridingOptions qos_options({rclcpp::QosPolicyKind::Reliability});
@@ -1065,6 +1271,7 @@ private:
         new_lidar_frame = true;
         mtx_buffer.lock();
         scan_count ++;
+        lidar_msg_count ++;
         double cur_time = get_time_sec(msg->header.stamp);
         double preprocess_start_time = omp_get_wtime();
         if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -1103,6 +1310,7 @@ private:
         double cur_time = get_time_sec(msg->header.stamp);
         double preprocess_start_time = omp_get_wtime();
         scan_count ++;
+        lidar_msg_count ++;
         if (!is_first_lidar && cur_time < last_timestamp_lidar)
         {
             std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -1143,9 +1351,60 @@ private:
         sig_buffer.notify_all();
     }
 
+    /*** Second LiDAR callbacks ***/
+    void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+    {
+        mtx_buffer.lock();
+        lidar2_msg_count ++;
+        double cur_time = get_time_sec(msg->header.stamp);
+        if (!is_first_lidar2 && cur_time < last_timestamp_lidar2)
+        {
+            std::cerr << "lidar2 loop back, clear buffer" << std::endl;
+            lidar_buffer2.clear();
+        }
+        if (is_first_lidar2)
+        {
+            std::cout << "First lidar2 msg received (standard_pcl_cbk2)" << std::endl;
+            is_first_lidar2 = false;
+        }
+
+        PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        p_pre2->process(msg, ptr);
+        lidar_buffer2.push_back(ptr);
+        time_buffer2.push_back(cur_time);
+        last_timestamp_lidar2 = cur_time;
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+    }
+
+    void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+    {
+        mtx_buffer.lock();
+        lidar2_msg_count ++;
+        double cur_time = get_time_sec(msg->header.stamp);
+        if (!is_first_lidar2 && cur_time < last_timestamp_lidar2)
+        {
+            std::cerr << "lidar2 loop back, clear buffer" << std::endl;
+            lidar_buffer2.clear();
+        }
+        if (is_first_lidar2)
+        {
+            std::cout << "First lidar2 msg received (livox_pcl_cbk2)" << std::endl;
+            is_first_lidar2 = false;
+        }
+        last_timestamp_lidar2 = cur_time;
+
+        PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        p_pre2->process(msg, ptr);
+        lidar_buffer2.push_back(ptr);
+        time_buffer2.push_back(last_timestamp_lidar2);
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+    }
+
     void timer_callback()
     {
-        if(sync_packages(Measures))
+        if(multi_lidar ? sync_packages_multi(Measures) : sync_packages(Measures))
         {
             if (flg_first_scan)
             {
@@ -1164,7 +1423,7 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
-            p_imu->Process(Measures, kf, feats_undistort);
+            p_imu->Process(Measures, kf, feats_undistort, multi_lidar);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1248,6 +1507,23 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            /*** Track distance traveled ***/
+            V3D cur_pos(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+            if (has_last_position)
+            {
+                double step = (cur_pos - last_position).norm();
+                if (step >= 0.01) // ignore noise below 1cm
+                {
+                    total_distance += step;
+                    last_position = cur_pos;
+                }
+            }
+            else
+            {
+                last_position = cur_pos;
+                has_last_position = true;
+            }
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_buffer_, tf_broadcaster_, static_tf_broadcaster_, this->get_logger());
 
@@ -1262,6 +1538,9 @@ private:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
+
+            /*** Terminal status display ***/
+            print_status(t5 - t0);
 
             /*** Debug variables ***/
             if (runtime_pos_log || diagnostics_en)
@@ -1354,6 +1633,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc2_;
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox2_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
@@ -1370,6 +1651,39 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
     double map_voxel_filter_size = 0.5, map_pub_interval = 1.0;
+
+    void print_status(double frame_time)
+    {
+        V3D cur_pos(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+        double dist_to_origin = cur_pos.norm();
+
+        // Clear terminal and print status
+        printf("\033[2J\033[1;1H");
+        std::cout << std::endl;
+        std::cout << "==== FAST-LIO" << (multi_lidar ? " MULTI" : "") << " ====" << std::endl;
+        std::cout << std::endl << std::setprecision(4) << std::fixed;
+        std::cout << "Position    [xyz]  :: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << std::endl;
+        V3D euler = SO3ToEuler(state_point.rot);
+        std::cout << "Orientation [rpy]  :: " << euler(0) << " " << euler(1) << " " << euler(2) << std::endl;
+        std::cout << "Distance Traveled  :: " << total_distance << " m" << std::endl;
+        std::cout << "Distance to Origin :: " << dist_to_origin << " m" << std::endl;
+        std::cout << std::endl;
+        std::cout << std::right << std::setprecision(2) << std::fixed;
+        std::cout << "--- Messages Received ---" << std::endl;
+        std::cout << "  IMU    [" << imu_topic << "] :: " << imu_msg_count << std::endl;
+        std::cout << "  LiDAR1 [" << lid_topic << "] :: " << lidar_msg_count << std::endl;
+        if (multi_lidar)
+            std::cout << "  LiDAR2 [" << lid_topic2 << "] :: " << lidar2_msg_count << std::endl;
+        std::cout << std::endl;
+        std::cout << "--- Performance ---" << std::endl;
+        std::cout << "  Frame Time    :: " << std::setfill(' ') << std::setw(7) << frame_time * 1000.0 << " ms" << std::endl;
+        std::cout << "  Avg Total     :: " << std::setfill(' ') << std::setw(7) << aver_time_consu * 1000.0 << " ms" << std::endl;
+        std::cout << "  Points (raw)  :: " << std::setfill(' ') << std::setw(7) << (feats_undistort ? (int)feats_undistort->points.size() : 0) << std::endl;
+        std::cout << "  Points (down) :: " << std::setfill(' ') << std::setw(7) << feats_down_size << std::endl;
+        std::cout << "  Eff. Features :: " << std::setfill(' ') << std::setw(7) << effct_feat_num << std::endl;
+        std::cout << "  Map Size      :: " << std::setfill(' ') << std::setw(7) << ikdtree.size() << std::endl;
+        std::cout << std::flush;
+    }
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
