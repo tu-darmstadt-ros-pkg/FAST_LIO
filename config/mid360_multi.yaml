@@ -1,0 +1,84 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        point_filter_num2: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        diagnostics_enable: true
+        map_file_path: ""
+
+        common:
+            multi_lidar: true                # false: single-LiDAR with the first LiDAR topic/extrinsic
+            update_mode: 1                   # 0: bundle (wait for both lidars), 1: async (process each independently)
+            lid_topic:  "/ec_swift/front_lidar/points_raw_livox"
+            lid_topic2: "/back"
+            imu_topic:  "/ec_swift/front_lidar/imu"
+            map_frame:  "map"
+            base_frame: "base_link"
+            sensor_init_frame: "sensor_init"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 1                    # 1 for Livox serials LiDAR, 2 for Velodyne, 3 for Ouster, 4 for Livox PointCloud2, 5 for generic
+            lidar_type2: 1                   # same options as lidar_type
+            scan_line: 4
+            scan_line2: 4
+            blind: 0.5
+            blind2: 0.5
+            timestamp_unit: 3                # 0-second, 1-ms, 2-us, 3-ns
+            timestamp_unit2: 3
+            scan_rate: 10                    # only for velodyne, unit: Hz
+            scan_rate2: 10
+
+        mapping:
+            acc_cov: 0.15
+            gyr_cov: 0.15
+            b_acc_cov: 0.0002
+            b_gyr_cov: 0.0002
+            fov_degree: 360.0
+            det_range: 100.0
+            extrinsic_est_en: false          # online estimation of IMU-LiDAR extrinsic (only for L1, not supported for multi-lidar)
+
+            ## IMU-to-L1 extrinsic (always required)
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0,
+                           0.0, 0.0, 1.0 ]
+
+            ## Choose extrinsic format for L2:
+            ## extrinsic_imu_to_lidars: true  => use (extrinsic_T2, extrinsic_R2) as IMU-to-L2
+            ## extrinsic_imu_to_lidars: false => use (extrinsic_T_L2_wrt_L1, extrinsic_R_L2_wrt_L1) as L2-in-L1-frame
+            extrinsic_imu_to_lidars: false
+
+            # extrinsic_T2: [ -0.011, -0.02329, 0.04412 ]
+            # extrinsic_R2: [ 1.0, 0.0, 0.0,
+            #                 0.0, 1.0, 0.0,
+            #                 0.0, 0.0, 1.0 ]
+
+            ## Extrinsic of L2 with respect to L1
+            ## If not provided, will look up from TF
+
+            # extrinsic_T_L2_wrt_L1: [ 0.000, 0.370, -0.214 ]
+            # extrinsic_R_L2_wrt_L1: [ -1.0000000,  0.0000000,  0.0000000,
+            #                           0.0000000, -0.5000000,  0.8660000,
+            #                           0.0000000,  0.8660000,  0.5000000 ]
+
+        publish:
+            rate: 10
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            map_pub_interval: 1.0
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+            map_voxelfilter_size: 0.3
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1
