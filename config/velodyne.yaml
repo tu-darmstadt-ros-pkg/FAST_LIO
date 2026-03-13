@@ -42,7 +42,13 @@
             dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
+        safety:
+            max_velocity: 3.0            # m/s - state is reset if estimated velocity exceeds this
+            max_angular_velocity: 5.0    # rad/s - state is reset if estimated angular velocity exceeds this
+            max_imu_dt: 0.5              # s - max allowed dt for a single IMU propagation step (larger steps are clamped)
+            gap_timeout: 1.0             # s - time gap between scans that triggers re-initialization
+
         pcd_save:
             pcd_save_en: true
-            interval: -1                 # how many LiDAR frames saved in each pcd file; 
+            interval: -1                 # how many LiDAR frames saved in each pcd file;
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

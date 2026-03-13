@@ -43,6 +43,7 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
@@ -364,10 +365,41 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
+double last_processed_lidar_time = 0.0;  // timestamp of last successfully processed lidar scan
+
 bool sync_packages(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
+    }
+
+    /*** Fix 2: Detect time gap between consecutive lidar scans ***/
+    if (last_processed_lidar_time > 0 && !lidar_pushed)
+    {
+        double gap = time_buffer.front() - last_processed_lidar_time;
+        if (gap > p_imu->gap_timeout)
+        {
+            std::cerr << "[FAST-LIO SAFETY] Time gap of " << gap << "s detected (threshold="
+                      << p_imu->gap_timeout << "s). Flushing stale buffers and triggering re-init." << std::endl;
+            // Flush all buffered data from before the gap
+            // Keep only the latest lidar scan and matching IMU data
+            while (lidar_buffer.size() > 1)
+            {
+                lidar_buffer.pop_front();
+                time_buffer.pop_front();
+            }
+            // Flush IMU data that predates the current lidar scan
+            double current_lidar_time = time_buffer.front();
+            while (!imu_buffer.empty() && get_time_sec(imu_buffer.front()->header.stamp) < current_lidar_time - 0.1)
+            {
+                imu_buffer.pop_front();
+            }
+            // Trigger IMU re-initialization
+            p_imu->gap_detected = true;
+            last_processed_lidar_time = 0.0;  // reset so we don't re-trigger
+            // Return false this cycle to let fresh data accumulate
+            return false;
+        }
     }
 
     /*** push a lidar scan ***/
@@ -412,6 +444,7 @@ bool sync_packages(MeasureGroup &meas)
         imu_buffer.pop_front();
     }
 
+    last_processed_lidar_time = meas.lidar_end_time;
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
@@ -1165,6 +1198,12 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
+        /*** Safety parameters for message gap robustness (reconfigurable at runtime) ***/
+        this->declare_parameter<double>("safety.max_velocity", 3.0);
+        this->declare_parameter<double>("safety.max_angular_velocity", 5.0);
+        this->declare_parameter<double>("safety.max_imu_dt", 0.5);
+        this->declare_parameter<double>("safety.gap_timeout", 1.0);
+
         /*** Multi-LiDAR parameter declarations ***/
         this->declare_parameter<bool>("common.multi_lidar", false);
         this->declare_parameter<int>("common.update_mode", 0);
@@ -1326,6 +1365,37 @@ public:
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+
+        /*** Read safety parameters and pass to ImuProcess ***/
+        this->get_parameter("safety.max_velocity", p_imu->max_velocity);
+        this->get_parameter("safety.max_angular_velocity", p_imu->max_angular_velocity);
+        this->get_parameter("safety.max_imu_dt", p_imu->max_imu_dt);
+        this->get_parameter("safety.gap_timeout", p_imu->gap_timeout);
+        RCLCPP_INFO(this->get_logger(), "Safety params: max_vel=%.1f m/s, max_angvel=%.1f rad/s, max_imu_dt=%.2f s, gap_timeout=%.1f s",
+                    p_imu->max_velocity, p_imu->max_angular_velocity, p_imu->max_imu_dt, p_imu->gap_timeout);
+
+        /*** Dynamic reconfigure callback for safety parameters ***/
+        param_callback_handle_ = this->add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter> &parameters) {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                for (const auto &param : parameters) {
+                    if (param.get_name() == "safety.max_velocity") {
+                        p_imu->max_velocity = param.as_double();
+                        RCLCPP_INFO(this->get_logger(), "Updated max_velocity: %.1f m/s", p_imu->max_velocity);
+                    } else if (param.get_name() == "safety.max_angular_velocity") {
+                        p_imu->max_angular_velocity = param.as_double();
+                        RCLCPP_INFO(this->get_logger(), "Updated max_angular_velocity: %.1f rad/s", p_imu->max_angular_velocity);
+                    } else if (param.get_name() == "safety.max_imu_dt") {
+                        p_imu->max_imu_dt = param.as_double();
+                        RCLCPP_INFO(this->get_logger(), "Updated max_imu_dt: %.2f s", p_imu->max_imu_dt);
+                    } else if (param.get_name() == "safety.gap_timeout") {
+                        p_imu->gap_timeout = param.as_double();
+                        RCLCPP_INFO(this->get_logger(), "Updated gap_timeout: %.1f s", p_imu->gap_timeout);
+                    }
+                }
+                return result;
+            });
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -1813,6 +1883,7 @@ private:
     rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
     
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;

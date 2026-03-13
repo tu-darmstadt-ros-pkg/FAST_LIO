@@ -42,6 +42,12 @@
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
             map_voxelfilter_size: 0.3    # Apply an additional voxel filter to the map before publishing, to reduce the size of the map point cloud. 0.0 : no voxel filter applied
 
+        safety:
+            max_velocity: 3.0            # m/s - state is reset if estimated velocity exceeds this
+            max_angular_velocity: 5.0    # rad/s - state is reset if estimated angular velocity exceeds this
+            max_imu_dt: 0.5              # s - max allowed dt for a single IMU propagation step (larger steps are clamped)
+            gap_timeout: 1.0             # s - time gap between scans that triggers re-initialization
+
         pcd_save:
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 

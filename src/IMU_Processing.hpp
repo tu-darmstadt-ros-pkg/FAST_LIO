@@ -58,6 +58,13 @@ class ImuProcess
   V3D cov_bias_acc;
   double first_lidar_time;
 
+  /*** Safety parameters for message gap robustness ***/
+  double max_velocity = 3.0;          // m/s - state reset if exceeded
+  double max_angular_velocity = 5.0;  // rad/s - state reset if exceeded
+  double max_imu_dt = 0.5;            // s - max allowed dt per IMU propagation step
+  double gap_timeout = 1.0;           // s - time gap threshold for re-initialization
+  bool   gap_detected = false;        // flag: a gap was detected, pending re-init
+
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
@@ -263,13 +270,24 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     if(head_stamp < last_lidar_end_time_)
     {
       dt = tail_stamp - last_lidar_end_time_;
-      // dt = tail->header.stamp.toSec() - pcl_beg_time;
     }
     else
     {
       dt = tail_stamp - head_stamp;
     }
-    
+
+    /*** Fix 1: Clamp dt to prevent state blowup from message gaps ***/
+    if (dt > max_imu_dt)
+    {
+      std::cerr << "[FAST-LIO SAFETY] IMU dt=" << dt << "s exceeds max_imu_dt=" << max_imu_dt << "s, clamping." << std::endl;
+      dt = max_imu_dt;
+    }
+    if (dt < 0)
+    {
+      std::cerr << "[FAST-LIO SAFETY] Negative IMU dt=" << dt << "s, skipping." << std::endl;
+      continue;
+    }
+
     in.acc = acc_avr;
     in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
@@ -280,6 +298,29 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
+
+    /*** Fix 3: Velocity and angular velocity sanity check after prediction ***/
+    double vel_norm = imu_state.vel.norm();
+    V3D omega_body = angvel_avr - imu_state.bg;
+    double omega_norm = omega_body.norm();
+    if (vel_norm > max_velocity || omega_norm > max_angular_velocity)
+    {
+      std::cerr << "[FAST-LIO SAFETY] State sanity check FAILED after IMU predict: "
+                << "vel=" << vel_norm << " m/s (max=" << max_velocity << "), "
+                << "omega=" << omega_norm << " rad/s (max=" << max_angular_velocity << "). "
+                << "Zeroing velocity, triggering re-init." << std::endl;
+      // Zero the velocity to prevent further divergence
+      state_ikfom corrected = kf_state.get_x();
+      corrected.vel = V3D(0, 0, 0);
+      kf_state.change_x(corrected);
+      // Reset covariance to large values to let the next scan matching correct the state
+      auto P = kf_state.get_P();
+      P(0,0) = P(1,1) = P(2,2) = 1.0;     // position
+      P(6,6) = P(7,7) = P(8,8) = 1.0;      // velocity (in DOF-indexed covariance)
+      kf_state.change_P(P);
+      imu_state = kf_state.get_x();
+    }
+
     angvel_last = angvel_avr - imu_state.bg;
     acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
     for(int i=0; i<3; i++)
@@ -293,8 +334,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  /*** Fix 1: Also clamp the frame-end extrapolation dt ***/
+  if (std::abs(dt) > max_imu_dt)
+  {
+    std::cerr << "[FAST-LIO SAFETY] Frame-end extrapolation dt=" << dt << "s exceeds max, clamping." << std::endl;
+    dt = (dt > 0 ? 1.0 : -1.0) * max_imu_dt;
+  }
   kf_state.predict(dt, Q, in);
-  
+
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
@@ -394,6 +441,18 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     else
       dt = tail_stamp - head_stamp;
 
+    /*** Fix 1: Clamp dt to prevent state blowup from message gaps ***/
+    if (dt > max_imu_dt)
+    {
+      std::cerr << "[FAST-LIO SAFETY] MultiLiDAR IMU dt=" << dt << "s exceeds max_imu_dt=" << max_imu_dt << "s, clamping." << std::endl;
+      dt = max_imu_dt;
+    }
+    if (dt < 0)
+    {
+      std::cerr << "[FAST-LIO SAFETY] MultiLiDAR negative IMU dt=" << dt << "s, skipping." << std::endl;
+      continue;
+    }
+
     in.acc = acc_avr;
     in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
@@ -404,6 +463,27 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
+
+    /*** Fix 3: Velocity and angular velocity sanity check after prediction ***/
+    double vel_norm = imu_state.vel.norm();
+    V3D omega_body = angvel_avr - imu_state.bg;
+    double omega_norm = omega_body.norm();
+    if (vel_norm > max_velocity || omega_norm > max_angular_velocity)
+    {
+      std::cerr << "[FAST-LIO SAFETY] MultiLiDAR state sanity check FAILED: "
+                << "vel=" << vel_norm << " m/s (max=" << max_velocity << "), "
+                << "omega=" << omega_norm << " rad/s (max=" << max_angular_velocity << "). "
+                << "Zeroing velocity, triggering re-init." << std::endl;
+      state_ikfom corrected = kf_state.get_x();
+      corrected.vel = V3D(0, 0, 0);
+      kf_state.change_x(corrected);
+      auto P = kf_state.get_P();
+      P(0,0) = P(1,1) = P(2,2) = 1.0;
+      P(6,6) = P(7,7) = P(8,8) = 1.0;
+      kf_state.change_P(P);
+      imu_state = kf_state.get_x();
+    }
+
     angvel_last = angvel_avr - imu_state.bg;
     acc_s_last  = imu_state.rot * (acc_avr - imu_state.ba);
     for(int i=0; i<3; i++)
@@ -417,6 +497,12 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  /*** Fix 1: Also clamp the frame-end extrapolation dt ***/
+  if (std::abs(dt) > max_imu_dt)
+  {
+    std::cerr << "[FAST-LIO SAFETY] MultiLiDAR frame-end extrapolation dt=" << dt << "s exceeds max, clamping." << std::endl;
+    dt = (dt > 0 ? 1.0 : -1.0) * max_imu_dt;
+  }
   kf_state.predict(dt, Q, in);
 
   imu_state = kf_state.get_x();
@@ -495,6 +581,28 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 
   if(meas.imu.empty()) {return;};
   assert(meas.lidar != nullptr);
+
+  /*** Fix 2: Handle gap detection - force re-initialization ***/
+  if (gap_detected)
+  {
+    std::cerr << "[FAST-LIO SAFETY] Gap detected flag set, forcing IMU re-initialization." << std::endl;
+    // Zero velocity and inflate covariance but keep position/orientation
+    state_ikfom cur_state = kf_state.get_x();
+    cur_state.vel = V3D(0, 0, 0);
+    kf_state.change_x(cur_state);
+    auto P = kf_state.get_P();
+    // Inflate position and velocity covariance
+    P(0,0) = P(1,1) = P(2,2) = 1.0;     // position uncertainty
+    P(6,6) = P(7,7) = P(8,8) = 1.0;      // velocity uncertainty
+    kf_state.change_P(P);
+    // Reset propagation state
+    last_lidar_end_time_ = 0;
+    angvel_last = Zero3d;
+    acc_s_last = V3D(0, 0, -G_m_s2);
+    last_imu_ = meas.imu.back();
+    gap_detected = false;
+    std::cerr << "[FAST-LIO SAFETY] State velocity zeroed, covariance inflated. Resuming with fresh data." << std::endl;
+  }
 
   if (imu_need_init_)
   {
