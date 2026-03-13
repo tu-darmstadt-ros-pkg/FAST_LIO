@@ -40,6 +40,8 @@
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
@@ -1939,7 +1941,43 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    auto node = std::make_shared<LaserMappingNode>();
+
+    /*** Realtime scheduling setup ***/
+    const int rt_priority = node->declare_parameter<int>("realtime.priority", 50);
+    const bool rt_lock_memory = node->declare_parameter<bool>("realtime.lock_memory", false);
+    const int rt_cpu_affinity = node->declare_parameter<int>("realtime.cpu_affinity", -1);
+
+    if (rt_lock_memory)
+    {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0)
+            RCLCPP_INFO(node->get_logger(), "Memory locked successfully (mlockall)");
+        else
+            RCLCPP_WARN(node->get_logger(), "Failed to lock memory: %s. Run with CAP_IPC_LOCK or as root.", strerror(errno));
+    }
+
+    if (rt_priority > 0)
+    {
+        struct sched_param param;
+        param.sched_priority = rt_priority;
+        if (sched_setscheduler(0, SCHED_FIFO, &param) == 0)
+            RCLCPP_INFO(node->get_logger(), "SCHED_FIFO enabled with priority %d", rt_priority);
+        else
+            RCLCPP_WARN(node->get_logger(), "Failed to set SCHED_FIFO (priority %d): %s. Run with CAP_SYS_NICE or as root.", rt_priority, strerror(errno));
+    }
+
+    if (rt_cpu_affinity >= 0)
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(rt_cpu_affinity, &cpuset);
+        if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0)
+            RCLCPP_INFO(node->get_logger(), "CPU affinity set to core %d", rt_cpu_affinity);
+        else
+            RCLCPP_WARN(node->get_logger(), "Failed to set CPU affinity to core %d: %s", rt_cpu_affinity, strerror(errno));
+    }
+
+    rclcpp::spin(node);
 
     if (rclcpp::ok())
         rclcpp::shutdown();

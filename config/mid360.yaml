@@ -57,6 +57,11 @@
             max_imu_dt: 0.5              # s - max allowed dt for a single IMU propagation step (larger steps are clamped)
             gap_timeout: 1.0             # s - time gap between scans that triggers re-initialization
 
+        realtime:
+            priority: 50               # SCHED_FIFO priority (0 = disabled). Requires CAP_SYS_NICE or root.
+            lock_memory: false          # Lock all memory pages (mlockall). Requires CAP_IPC_LOCK or root.
+            cpu_affinity: -1            # Pin to specific CPU core (-1 = disabled)
+
         pcd_save:
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 
