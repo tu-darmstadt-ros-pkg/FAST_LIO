@@ -1956,18 +1956,6 @@ private:
         // === Reset Arrays ===
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
-        memset(T1, 0.0, sizeof(T1));
-        memset(s_plot, 0.0, sizeof(s_plot));
-        memset(s_plot2, 0.0, sizeof(s_plot2));
-        memset(s_plot3, 0.0, sizeof(s_plot3));
-        memset(s_plot4, 0.0, sizeof(s_plot4));
-        memset(s_plot5, 0.0, sizeof(s_plot5));
-        memset(s_plot6, 0.0, sizeof(s_plot6));
-        memset(s_plot7, 0.0, sizeof(s_plot7));
-        memset(s_plot8, 0.0, sizeof(s_plot8));
-        memset(s_plot9, 0.0, sizeof(s_plot9));
-        memset(s_plot10, 0.0, sizeof(s_plot10));
-        memset(s_plot11, 0.0, sizeof(s_plot11));
 
         // === Reset Path ===
         path.poses.clear();
