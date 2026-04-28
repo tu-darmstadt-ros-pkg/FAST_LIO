@@ -822,7 +822,6 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     {
         pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     }
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = sensor_init_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
@@ -1842,6 +1841,9 @@ private:
         cub_needrm.clear();
         pointSearchInd_surf.clear();
         Nearest_Points.clear();
+
+        // TODO reset global map
+        pcl_wait_pub->clear();
 
         // === Reset Counters ===
         effct_feat_num = 0;
