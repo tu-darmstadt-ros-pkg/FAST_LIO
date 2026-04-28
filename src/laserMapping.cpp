@@ -790,7 +790,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, const rclcpp::Logger& logger)
 {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
@@ -822,17 +822,12 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     {
         pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     }
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = sensor_init_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
     new_lidar_frame = false;
 
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
+    RCLCPP_DEBUG(logger, "Map published with %d points (after filter: %d)", pcl_wait_pub->size(), laserCloudmsg.width * laserCloudmsg.height);
 }
 
 void publish_diagnostics(rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics, double aver_time)
@@ -1393,7 +1388,8 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
         diagnostics_pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&LaserMappingNode::diagnostics_callback, this));
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("~/map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        state_reset_srv_ = this->create_service<std_srvs::srv::Trigger>("~/reset", std::bind(&LaserMappingNode::state_reset_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1704,8 +1700,12 @@ private:
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
-            /*** Terminal status display ***/
-            print_status(t5 - t0);
+            /*** Terminal status display (throttled to 5Hz) ***/
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print_status_time) >= print_status_throttle_interval) {
+                print_status(t5 - t0);
+                last_print_status_time = now;
+            }
 
             /*** Debug variables ***/
             if (runtime_pos_log || diagnostics_en)
@@ -1747,7 +1747,7 @@ private:
     
     void map_publish_callback()
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        if (map_pub_en) publish_map(pubLaserCloudMap_, this->get_logger());
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1782,6 +1782,126 @@ private:
         }
     }
 
+    void state_reset_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    {
+        RCLCPP_WARN(this->get_logger(), "State reset requested via service call. Resetting filter state and clearing map...");
+
+        mtx_buffer.lock();
+
+        // === Reset Message Counters ===
+        imu_msg_count = 0;
+        lidar_msg_count = 0;
+        lidar2_msg_count = 0;
+
+        // === Reset First Message Flags ===
+        is_first_lidar = true;
+        is_first_lidar2 = true;
+        is_first_imu = true;
+        flg_first_scan = true;
+
+        // === Reset Push Flags ===
+        lidar_pushed = false;
+        lidar_pushed2 = false;
+        new_lidar_frame = false;
+
+        // === Reset EKF State ===
+        flg_EKF_inited = false;
+
+        // === Reset Timestamps ===
+        last_timestamp_lidar = 0;
+        last_timestamp_imu = -1.0;
+        last_timestamp_lidar2 = 0;
+        lidar_end_time = 0;
+        lidar_end_time2 = 0;
+        first_lidar_time = 0.0;
+        timediff_set_flg = false;
+
+        // === Reset Buffers ===
+        time_buffer.clear();
+        lidar_buffer.clear();
+        imu_buffer.clear();
+        time_buffer2.clear();
+        lidar_buffer2.clear();
+
+        // === Reset Point Clouds ===
+        featsFromMap->clear();
+        feats_undistort->clear();
+        feats_down_body->clear();
+        feats_down_world->clear();
+        normvec->clear();
+        laserCloudOri->clear();
+        corr_normvect->clear();
+
+        // === Clear the KD-Tree ===
+        PointVector empty_points;
+        ikdtree.Build(empty_points);
+
+        // === Reset Local Map State ===
+        Localmap_Initialized = false;
+        cub_needrm.clear();
+        pointSearchInd_surf.clear();
+        Nearest_Points.clear();
+
+        // Reset global map
+        pcl_wait_pub->clear();
+
+        // === Reset Counters ===
+        effct_feat_num = 0;
+        time_log_counter = 0;
+        scan_count = 0;
+        publish_count = 0;
+        iterCount = 0;
+        feats_down_size = 0;
+        laserCloudValidNum = 0;
+        pcd_index = 0;
+        scan_num = 0;
+        scan_num2 = 0;
+        last_async_lidar = 0;
+        kdtree_delete_counter = 0;
+        kdtree_size_st = 0;
+        kdtree_size_end = 0;
+        add_point_size = 0;
+        process_increments = 0;
+
+        // === Reset Time Statistics ===
+        res_mean_last = 0.05;
+        total_residual = 0.0;
+        lidar_mean_scantime = 0.0;
+        lidar_mean_scantime2 = 0.0;
+        kdtree_incremental_time = 0.0;
+        kdtree_search_time = 0.0;
+        kdtree_delete_time = 0.0;
+        match_time = 0;
+        solve_time = 0;
+        solve_const_H_time = 0;
+
+        // === Reset State Point (EKF State) ===
+        state_ikfom reset_state;
+        state_point = reset_state;
+        kf.change_x(reset_state);
+        pos_lid = Zero3d;
+        position_last = Zero3d;
+        euler_cur = Zero3d;
+
+        // === Reset Arrays ===
+        memset(point_selected_surf, true, sizeof(point_selected_surf));
+        memset(res_last, -1000.0f, sizeof(res_last));
+
+        // === Reset Path ===
+        path.poses.clear();
+        path.header.stamp = this->get_clock()->now();
+        path.header.frame_id = sensor_init_frame;
+
+        // === Reset IMU Processor ===
+        p_imu->Reset();
+
+        mtx_buffer.unlock();
+
+        RCLCPP_WARN(this->get_logger(), "State reset completed successfully.");
+        res->success = true;
+        res->message = "State reset successful.";
+    }
+
     void diagnostics_callback()
     {
         if (diagnostics_en)
@@ -1812,13 +1932,18 @@ private:
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr state_reset_srv_;
     
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
+    
+    // Throttling for print_status (5Hz = 200ms min interval)
+    std::chrono::steady_clock::time_point last_print_status_time = std::chrono::steady_clock::now();
+    const std::chrono::milliseconds print_status_throttle_interval{200}; // 5Hz throttle
     double epsi[23] = {0.001};
-    double map_voxel_filter_size = 0.5, map_pub_interval = 1.0;
+    double map_voxel_filter_size = 0.25, map_pub_interval = 2.0;
 
     void print_status(double frame_time)
     {
