@@ -860,7 +860,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pubLaserCloudMap->publish(laserCloudmsg);
     new_lidar_frame = false;
 
-    RCLCPP_INFO(logger, "Map published with %d points (after filter: %d)", pcl_wait_pub->size(), laserCloudmsg.width * laserCloudmsg.height);
+    RCLCPP_DEBUG(logger, "Map published with %d points (after filter: %d)", pcl_wait_pub->size(), laserCloudmsg.width * laserCloudmsg.height);
 }
 
 void publish_diagnostics(rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics, double aver_time)
