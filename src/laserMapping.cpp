@@ -1842,7 +1842,7 @@ private:
         pointSearchInd_surf.clear();
         Nearest_Points.clear();
 
-        // TODO reset global map
+        // Reset global map
         pcl_wait_pub->clear();
 
         // === Reset Counters ===
@@ -1955,7 +1955,7 @@ private:
     std::chrono::steady_clock::time_point last_print_status_time = std::chrono::steady_clock::now();
     const std::chrono::milliseconds print_status_throttle_interval{200}; // 5Hz throttle
     double epsi[23] = {0.001};
-    double map_voxel_filter_size = 0.5, map_pub_interval = 1.0;
+    double map_voxel_filter_size = 0.25, map_pub_interval = 2.0;
 
     void print_status(double frame_time)
     {
