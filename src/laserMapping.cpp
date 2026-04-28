@@ -1775,8 +1775,12 @@ private:
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
-            /*** Terminal status display ***/
-            print_status(t5 - t0);
+            /*** Terminal status display (throttled to 5Hz) ***/
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print_status_time) >= print_status_throttle_interval) {
+                print_status(t5 - t0);
+                last_print_status_time = now;
+            }
 
             /*** Debug variables ***/
             if (runtime_pos_log || diagnostics_en)
@@ -2019,6 +2023,10 @@ private:
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
+    
+    // Throttling for print_status (5Hz = 200ms min interval)
+    std::chrono::steady_clock::time_point last_print_status_time = std::chrono::steady_clock::now();
+    const std::chrono::milliseconds print_status_throttle_interval{200}; // 5Hz throttle
     double epsi[23] = {0.001};
     double map_voxel_filter_size = 0.5, map_pub_interval = 1.0;
 
