@@ -1394,6 +1394,7 @@ public:
         diagnostics_pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&LaserMappingNode::diagnostics_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        state_reset_srv_ = this->create_service<std_srvs::srv::Trigger>("state_reset", std::bind(&LaserMappingNode::state_reset_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1782,6 +1783,135 @@ private:
         }
     }
 
+    void state_reset_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    {
+        RCLCPP_WARN(this->get_logger(), "State reset requested via service call. Resetting filter state and clearing map...");
+
+        mtx_buffer.lock();
+
+        // === Reset Message Counters ===
+        imu_msg_count = 0;
+        lidar_msg_count = 0;
+        lidar2_msg_count = 0;
+
+        // === Reset First Message Flags ===
+        is_first_lidar = true;
+        is_first_lidar2 = true;
+        is_first_imu = true;
+        flg_first_scan = true;
+
+        // === Reset Push Flags ===
+        lidar_pushed = false;
+        lidar_pushed2 = false;
+        new_lidar_frame = false;
+
+        // === Reset EKF State ===
+        flg_EKF_inited = false;
+
+        // === Reset Timestamps ===
+        last_timestamp_lidar = 0;
+        last_timestamp_imu = -1.0;
+        last_timestamp_lidar2 = 0;
+        lidar_end_time = 0;
+        lidar_end_time2 = 0;
+        first_lidar_time = 0.0;
+        timediff_set_flg = false;
+
+        // === Reset Buffers ===
+        time_buffer.clear();
+        lidar_buffer.clear();
+        imu_buffer.clear();
+        time_buffer2.clear();
+        lidar_buffer2.clear();
+
+        // === Reset Point Clouds ===
+        featsFromMap->clear();
+        feats_undistort->clear();
+        feats_down_body->clear();
+        feats_down_world->clear();
+        normvec->clear();
+        laserCloudOri->clear();
+        corr_normvect->clear();
+
+        // === Clear the KD-Tree ===
+        PointVector empty_points;
+        ikdtree.Build(empty_points);
+
+        // === Reset Local Map State ===
+        Localmap_Initialized = false;
+        cub_needrm.clear();
+        pointSearchInd_surf.clear();
+        Nearest_Points.clear();
+
+        // === Reset Counters ===
+        effct_feat_num = 0;
+        time_log_counter = 0;
+        scan_count = 0;
+        publish_count = 0;
+        iterCount = 0;
+        feats_down_size = 0;
+        laserCloudValidNum = 0;
+        pcd_index = 0;
+        scan_num = 0;
+        scan_num2 = 0;
+        last_async_lidar = 0;
+        kdtree_delete_counter = 0;
+        kdtree_size_st = 0;
+        kdtree_size_end = 0;
+        add_point_size = 0;
+        process_increments = 0;
+
+        // === Reset Time Statistics ===
+        res_mean_last = 0.05;
+        total_residual = 0.0;
+        lidar_mean_scantime = 0.0;
+        lidar_mean_scantime2 = 0.0;
+        kdtree_incremental_time = 0.0;
+        kdtree_search_time = 0.0;
+        kdtree_delete_time = 0.0;
+        match_time = 0;
+        solve_time = 0;
+        solve_const_H_time = 0;
+
+        // === Reset State Point (EKF State) ===
+        state_ikfom reset_state;
+        state_point = reset_state;
+        kf.change_x(reset_state);
+        pos_lid = Zero3d;
+        position_last = Zero3d;
+        euler_cur = Zero3d;
+
+        // === Reset Arrays ===
+        memset(point_selected_surf, true, sizeof(point_selected_surf));
+        memset(res_last, -1000.0f, sizeof(res_last));
+        memset(T1, 0.0, sizeof(T1));
+        memset(s_plot, 0.0, sizeof(s_plot));
+        memset(s_plot2, 0.0, sizeof(s_plot2));
+        memset(s_plot3, 0.0, sizeof(s_plot3));
+        memset(s_plot4, 0.0, sizeof(s_plot4));
+        memset(s_plot5, 0.0, sizeof(s_plot5));
+        memset(s_plot6, 0.0, sizeof(s_plot6));
+        memset(s_plot7, 0.0, sizeof(s_plot7));
+        memset(s_plot8, 0.0, sizeof(s_plot8));
+        memset(s_plot9, 0.0, sizeof(s_plot9));
+        memset(s_plot10, 0.0, sizeof(s_plot10));
+        memset(s_plot11, 0.0, sizeof(s_plot11));
+
+        // === Reset Path ===
+        path.poses.clear();
+        path.header.stamp = this->get_clock()->now();
+        path.header.frame_id = sensor_init_frame;
+
+        // === Reset IMU Processor ===
+        p_imu->Reset();
+
+        mtx_buffer.unlock();
+
+        RCLCPP_WARN(this->get_logger(), "State reset completed successfully.");
+        res->success = true;
+        res->message = "State reset successful.";
+    }
+
     void diagnostics_callback()
     {
         if (diagnostics_en)
@@ -1812,6 +1942,7 @@ private:
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::TimerBase::SharedPtr diagnostics_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr state_reset_srv_;
     
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
