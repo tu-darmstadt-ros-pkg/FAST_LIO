@@ -1459,7 +1459,7 @@ public:
         diagnostics_pub_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), std::bind(&LaserMappingNode::diagnostics_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("~/map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
-        state_reset_srv_ = this->create_service<std_srvs::srv::Trigger>("~/state_reset", std::bind(&LaserMappingNode::state_reset_callback, this, std::placeholders::_1, std::placeholders::_2));
+        state_reset_srv_ = this->create_service<std_srvs::srv::Trigger>("~/reset", std::bind(&LaserMappingNode::state_reset_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
