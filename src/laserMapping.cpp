@@ -43,6 +43,7 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_components/register_node_macro.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -2100,3 +2101,5 @@ int main(int argc, char** argv)
 
     return 0;
 }
+
+RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode)
