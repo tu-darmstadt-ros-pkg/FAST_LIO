@@ -99,7 +99,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 ament_export_dependencies(rosidl_default_runtime)
 
-# Changed from add_executable to add_library (SHARED) for component support
 add_library(fastlio_component SHARED src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
 
 target_include_directories(fastlio_component PUBLIC
@@ -125,7 +124,7 @@ ament_target_dependencies(fastlio_component ${dependencies})
 
 # Register the component so it can be loaded into containers
 rclcpp_components_register_node(fastlio_component
-  PLUGIN "fast_lio::LaserMapping"
+  PLUGIN "LaserMappingNode"
   EXECUTABLE fastlio_mapping_node
 )
 
