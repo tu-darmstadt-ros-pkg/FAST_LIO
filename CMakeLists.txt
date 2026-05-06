@@ -99,32 +99,41 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 ament_export_dependencies(rosidl_default_runtime)
 
-add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
-target_include_directories(fastlio_mapping PUBLIC
+# Changed from add_executable to add_library (SHARED) for component support
+add_library(fastlio_component SHARED src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+
+target_include_directories(fastlio_component PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
-target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+target_link_libraries(fastlio_component ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
+target_include_directories(fastlio_component PRIVATE ${PYTHON_INCLUDE_DIRS})
 
 list(APPEND EOL_LIST "foxy" "galactic" "eloquent" "dashing" "crystal")
 
 if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)
-  # Custommsg to support foxy & galactic
-  rosidl_target_interfaces(fastlio_mapping
+  rosidl_target_interfaces(fastlio_component
     ${PROJECT_NAME} "rosidl_typesupport_cpp")
 else()
   rosidl_get_typesupport_target(cpp_typesupport_target
     ${PROJECT_NAME} "rosidl_typesupport_cpp")
-  target_link_libraries(fastlio_mapping ${cpp_typesupport_target})
+  target_link_libraries(fastlio_component ${cpp_typesupport_target})
 endif()
 
-ament_target_dependencies(fastlio_mapping ${dependencies})
+ament_target_dependencies(fastlio_component ${dependencies})
+
+# Register the component so it can be loaded into containers
+rclcpp_components_register_node(fastlio_component
+  PLUGIN "fast_lio::LaserMapping"
+  EXECUTABLE fastlio_mapping_node
+)
 
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
-  DESTINATION lib/${PROJECT_NAME}
+install(TARGETS fastlio_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(
