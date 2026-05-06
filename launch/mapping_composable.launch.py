@@ -1,0 +1,82 @@
+import os.path
+from ament_index_python.packages import get_package_share_directory
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.conditions import IfCondition
+
+from launch_ros.actions import Node, ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
+
+def generate_launch_description():
+    package_path = get_package_share_directory('fast_lio')
+    default_config_path = os.path.join(package_path, 'config')
+    default_rviz_config_path = os.path.join(
+        package_path, 'rviz', 'fastlio.rviz')
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    config_path = LaunchConfiguration('config_path')
+    config_file = LaunchConfiguration('config_file')
+    rviz_use = LaunchConfiguration('rviz')
+    rviz_cfg = LaunchConfiguration('rviz_cfg')
+
+    # Arguments
+    declare_use_sim_time_cmd = DeclareLaunchArgument(
+        'use_sim_time', default_value='false',
+        description='Use simulation clock if true'
+    )
+    declare_config_path_cmd = DeclareLaunchArgument(
+        'config_path', default_value=default_config_path,
+        description='Yaml config file path'
+    )
+    declare_config_file_cmd = DeclareLaunchArgument(
+        'config_file', default_value='mid360.yaml',
+        description='Config file'
+    )
+    declare_rviz_cmd = DeclareLaunchArgument(
+        'rviz', default_value='true',
+        description='Use RViz'
+    )
+    declare_rviz_config_path_cmd = DeclareLaunchArgument(
+        'rviz_cfg', default_value=default_rviz_config_path,
+        description='RViz config file path'
+    )
+
+    # Component Container
+    fast_lio_container = ComposableNodeContainer(
+        name='fast_lio_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container',
+        composable_node_descriptions=[
+            ComposableNode(
+                package='fast_lio',
+                plugin='LaserMappingNode', # Must match the class name in your macro
+                name='fast_lio_node',
+                parameters=[PathJoinSubstitution([config_path, config_file]),
+                            {'use_sim_time': use_sim_time}],
+            ),
+        ],
+        output='screen',
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        parameters=[{'use_sim_time': use_sim_time}],
+        arguments=['-d', rviz_cfg],
+        condition=IfCondition(rviz_use)
+    )
+
+    ld = LaunchDescription()
+    ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_config_path_cmd)
+    ld.add_action(declare_config_file_cmd)
+    ld.add_action(declare_rviz_cmd)
+    ld.add_action(declare_rviz_config_path_cmd)
+
+    ld.add_action(fast_lio_container)
+    ld.add_action(rviz_node)
+
+    return ld
