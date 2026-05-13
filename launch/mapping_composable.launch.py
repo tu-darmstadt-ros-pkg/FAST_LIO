@@ -14,12 +14,14 @@ def generate_launch_description():
     default_config_path = os.path.join(package_path, 'config')
     default_rviz_config_path = os.path.join(
         package_path, 'rviz', 'fastlio.rviz')
+    default_container_name = 'fast_lio_container'
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     config_path = LaunchConfiguration('config_path')
     config_file = LaunchConfiguration('config_file')
     rviz_use = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
+    container_name = LaunchConfiguration('container')
 
     # Arguments
     declare_use_sim_time_cmd = DeclareLaunchArgument(
@@ -42,10 +44,14 @@ def generate_launch_description():
         'rviz_cfg', default_value=default_rviz_config_path,
         description='RViz config file path'
     )
+    declare_container_name_cmd = DeclareLaunchArgument(
+        'container', default_value=default_container_name,
+        description='Composable node container name'
+    )
 
     # Component Container
     fast_lio_container = ComposableNodeContainer(
-        name='fast_lio_container',
+        name=container_name,
         namespace='',
         package='rclcpp_components',
         executable='component_container_mt',
@@ -75,7 +81,7 @@ def generate_launch_description():
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
-
+    ld.add_action(declare_container_name_cmd)
     ld.add_action(fast_lio_container)
     ld.add_action(rviz_node)
 
