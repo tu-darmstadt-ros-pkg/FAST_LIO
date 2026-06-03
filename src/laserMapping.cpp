@@ -328,7 +328,7 @@ void lasermap_fov_segment()
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 
-void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
     publish_count ++;
     imu_msg_count ++;
@@ -714,12 +714,12 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
                                 &laserCloudWorld->points[i]);
         }
 
-        sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
+        auto laserCloudmsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+        pcl::toROSMsg(*laserCloudWorld, *laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = sensor_init_frame;
-        pubLaserCloudFull->publish(laserCloudmsg);
+        laserCloudmsg->header.stamp = get_ros_time(lidar_end_time);
+        laserCloudmsg->header.frame_id = sensor_init_frame;
+        pubLaserCloudFull->publish(std::move(laserCloudmsg));
         publish_count -= PUBFRAME_PERIOD;
     }
 
@@ -767,11 +767,11 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
                             &laserCloudIMUBody->points[i]);
     }
 
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = lidar_frame;
-    pubLaserCloudFull_body->publish(laserCloudmsg);
+    auto laserCloudmsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*laserCloudIMUBody, *laserCloudmsg);
+    laserCloudmsg->header.stamp = get_ros_time(lidar_end_time);
+    laserCloudmsg->header.frame_id = lidar_frame;
+    pubLaserCloudFull_body->publish(std::move(laserCloudmsg));
     publish_count -= PUBFRAME_PERIOD;
 }
 
@@ -784,11 +784,11 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
         RGBpointBodyToWorld(&laserCloudOri->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
-    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = sensor_init_frame;
-    pubLaserCloudEffect->publish(laserCloudFullRes3);
+    auto laserCloudFullRes3 = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*laserCloudWorld, *laserCloudFullRes3);
+    laserCloudFullRes3->header.stamp = get_ros_time(lidar_end_time);
+    laserCloudFullRes3->header.frame_id = sensor_init_frame;
+    pubLaserCloudEffect->publish(std::move(laserCloudFullRes3));
 }
 
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, const rclcpp::Logger& logger)
@@ -811,24 +811,23 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     }
 
     // Apply additional voxel filter to downsample the map before publishing
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    auto laserCloudmsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
     if (mapPubVoxelFilter.getLeafSize().x() > 0.0f)
     {
         PointCloudXYZI::Ptr pcl_wait_pub_filtered(new PointCloudXYZI());
         mapPubVoxelFilter.setInputCloud(pcl_wait_pub);
         mapPubVoxelFilter.filter(*pcl_wait_pub_filtered);
-        pcl::toROSMsg(*pcl_wait_pub_filtered, laserCloudmsg);
+        pcl::toROSMsg(*pcl_wait_pub_filtered, *laserCloudmsg);
     }
     else
     {
-        pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+        pcl::toROSMsg(*pcl_wait_pub, *laserCloudmsg);
     }
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = sensor_init_frame;
-    pubLaserCloudMap->publish(laserCloudmsg);
+    laserCloudmsg->header.stamp = get_ros_time(lidar_end_time);
+    laserCloudmsg->header.frame_id = sensor_init_frame;
+    RCLCPP_DEBUG(logger, "Map published with %lu points (after filter: %d)", pcl_wait_pub->size(), laserCloudmsg->width * laserCloudmsg->height);
+    pubLaserCloudMap->publish(std::move(laserCloudmsg));
     new_lidar_frame = false;
-
-    RCLCPP_DEBUG(logger, "Map published with %d points (after filter: %d)", pcl_wait_pub->size(), laserCloudmsg.width * laserCloudmsg.height);
 }
 
 void publish_diagnostics(rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics, double aver_time)
@@ -1404,7 +1403,7 @@ public:
 
 private:
 
-    void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+    void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
     {
         lidar_frame = msg->header.frame_id;
         new_lidar_frame = true;
@@ -1440,7 +1439,7 @@ private:
         sig_buffer.notify_all();
     }
 
-    void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+    void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg)
     {
         lidar_frame = msg->header.frame_id;
         new_lidar_frame = true;
@@ -1491,7 +1490,7 @@ private:
     }
 
     /*** Second LiDAR callbacks ***/
-    void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+    void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
     {
         mtx_buffer.lock();
         lidar2_msg_count ++;
@@ -1517,7 +1516,7 @@ private:
         sig_buffer.notify_all();
     }
 
-    void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+    void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg)
     {
         mtx_buffer.lock();
         lidar2_msg_count ++;
@@ -1751,7 +1750,7 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_, this->get_logger());
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void map_save_callback(const std_srvs::srv::Trigger::Request::ConstSharedPtr &req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         std::string abs_path = map_file_path;
         if (!map_file_path.empty())
@@ -1783,7 +1782,7 @@ private:
         }
     }
 
-    void state_reset_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void state_reset_callback(const std_srvs::srv::Trigger::Request::ConstSharedPtr &req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         RCLCPP_WARN(this->get_logger(), "State reset requested via service call. Resetting filter state and clearing map...");
 
