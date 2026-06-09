@@ -128,6 +128,8 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
+PointCloudXYZI::Ptr feats_undistort_L1(new PointCloudXYZI());
+PointCloudXYZI::Ptr feats_undistort_L2(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
@@ -701,6 +703,7 @@ PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
+    if (pubLaserCloudFull->get_subscription_count() == 0) return;
     if(scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
@@ -756,8 +759,26 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     */
 }
 
+void publish_frame_world_for(
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub,
+    PointCloudXYZI::Ptr cloud)
+{
+    if (pub->get_subscription_count() == 0) return;
+    if (!scan_pub_en || !cloud || cloud->empty()) return;
+    int size = cloud->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++)
+        RGBpointBodyToWorld(&cloud->points[i], &laserCloudWorld->points[i]);
+    auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*laserCloudWorld, *msg);
+    msg->header.stamp = get_ros_time(lidar_end_time);
+    msg->header.frame_id = sensor_init_frame;
+    pub->publish(std::move(msg));
+}
+
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
 {
+    if (pubLaserCloudFull_body->get_subscription_count() == 0) return;
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
 
@@ -777,6 +798,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
 
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
+    if (pubLaserCloudEffect->get_subscription_count() == 0) return;
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
     for (int i = 0; i < effct_feat_num; i++)
@@ -793,6 +815,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
 
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, const rclcpp::Logger& logger)
 {
+    if (pubLaserCloudMap->get_subscription_count() == 0) return;
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -1370,6 +1393,8 @@ public:
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sub_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_body", 20);
+        pubLaserCloud_L1_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L1", 20);
+        pubLaserCloud_L2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L2", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("Odometry", 20);
@@ -1601,7 +1626,8 @@ private:
 
             // In async mode, each lidar is processed individually (no multi undistort needed)
             bool use_multi_undistort = multi_lidar && (update_mode == 0);
-            p_imu->Process(Measures, kf, feats_undistort, use_multi_undistort);
+            p_imu->Process(Measures, kf, feats_undistort, feats_undistort_L1, feats_undistort_L2, use_multi_undistort);
+
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1697,6 +1723,15 @@ private:
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+            if (multi_lidar && scan_pub_en) {
+                if (update_mode == 0) { // bundle mode
+                    publish_frame_world_for(pubLaserCloud_L1_, feats_undistort_L1);
+                    publish_frame_world_for(pubLaserCloud_L2_, feats_undistort_L2);
+                } else { // async mode
+                    auto& pub = (last_async_lidar == 1) ? pubLaserCloud_L1_ : pubLaserCloud_L2_;
+                    publish_frame_world_for(pub, feats_undistort);
+                }
+            }
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
@@ -1913,6 +1948,8 @@ private:
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L1_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L2_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
