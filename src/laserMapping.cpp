@@ -1396,7 +1396,8 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        // TransformListener needs node, so remaps in container work, otherwise it spawns separate node which will not have remaps.
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000 / pub_rate)); // Hz to ms
