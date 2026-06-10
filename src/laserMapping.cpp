@@ -759,20 +759,43 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     */
 }
 
-void publish_frame_world_for(
+void publish_frame_lidar_for(
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub,
-    PointCloudXYZI::Ptr cloud)
+    PointCloudXYZI::Ptr cloud,
+    const std::string& frame_id,
+    const M3D& R_inv,
+    const V3D& T_inv)
 {
     if (pub->get_subscription_count() == 0) return;
     if (!scan_pub_en || !cloud || cloud->empty()) return;
     int size = cloud->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-    for (int i = 0; i < size; i++)
-        RGBpointBodyToWorld(&cloud->points[i], &laserCloudWorld->points[i]);
+    PointCloudXYZI::Ptr out(new PointCloudXYZI(size, 1));
+    for (int i = 0; i < size; i++) {
+        V3D p(cloud->points[i].x, cloud->points[i].y, cloud->points[i].z);
+        V3D p_out = R_inv * (p - T_inv);
+        out->points[i].x = p_out(0);
+        out->points[i].y = p_out(1);
+        out->points[i].z = p_out(2);
+        out->points[i].intensity = cloud->points[i].intensity;
+    }
     auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    pcl::toROSMsg(*laserCloudWorld, *msg);
+    pcl::toROSMsg(*out, *msg);
     msg->header.stamp = get_ros_time(lidar_end_time);
-    msg->header.frame_id = sensor_init_frame;
+    msg->header.frame_id = frame_id;
+    pub->publish(std::move(msg));
+}
+
+void publish_frame_lidar_for(
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub,
+    PointCloudXYZI::Ptr cloud,
+    const std::string& frame_id)
+{
+    if (pub->get_subscription_count() == 0) return;
+    if (!scan_pub_en || !cloud || cloud->empty()) return;
+    auto msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*cloud, *msg);
+    msg->header.stamp = get_ros_time(lidar_end_time);
+    msg->header.frame_id = frame_id;
     pub->publish(std::move(msg));
 }
 
@@ -1719,11 +1742,15 @@ private:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (multi_lidar && scan_pub_en) {
                 if (update_mode == 0) { // bundle mode
-                    publish_frame_world_for(pubLaserCloud_L1_, feats_undistort_L1);
-                    publish_frame_world_for(pubLaserCloud_L2_, feats_undistort_L2);
+                    publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort_L1, lidar_frame);
+                    publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2,
+                        Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
                 } else { // async mode
-                    auto& pub = (last_async_lidar == 1) ? pubLaserCloud_L1_ : pubLaserCloud_L2_;
-                    publish_frame_world_for(pub, feats_undistort);
+                    if (last_async_lidar == 1)
+                        publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort, lidar_frame);
+                    else
+                        publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort, lidar_frame2,
+                            Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
                 }
             }
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
