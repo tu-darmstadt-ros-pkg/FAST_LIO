@@ -239,6 +239,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  in.acc  << last_imu_->linear_acceleration.x, last_imu_->linear_acceleration.y, last_imu_->linear_acceleration.z;
+  in.gyro << last_imu_->angular_velocity.x,    last_imu_->angular_velocity.y,    last_imu_->angular_velocity.z;
+  in.acc = in.acc * G_m_s2 / mean_acc.norm();
+
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -248,7 +252,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
     if (tail_stamp < last_lidar_end_time_)    continue;
-    
+
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
                 0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
@@ -294,9 +298,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
   kf_state.predict(dt, Q, in);
-  
+
   imu_state = kf_state.get_x();
-  last_imu_ = meas.imu.back();
+  if (!meas.imu.empty()) last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
   /*** undistort each lidar point (backward propagation) ***/
@@ -370,6 +374,10 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   M3D R_imu;
   double dt = 0;
   input_ikfom in;
+  in.acc  << last_imu_->linear_acceleration.x, last_imu_->linear_acceleration.y, last_imu_->linear_acceleration.z;
+  in.gyro << last_imu_->angular_velocity.x,    last_imu_->angular_velocity.y,    last_imu_->angular_velocity.z;
+  in.acc = in.acc * G_m_s2 / mean_acc.norm();
+
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -420,7 +428,7 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   kf_state.predict(dt, Q, in);
 
   imu_state = kf_state.get_x();
-  last_imu_ = meas.imu.back();
+  if (!meas.imu.empty()) last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
   /*** undistort L1 points (backward propagation) ***/
@@ -496,7 +504,7 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   pcl_un_->clear();
   if (multi_lidar) { pcl_L1_out->clear(); pcl_L2_out->clear(); }
 
-  if(meas.imu.empty()) {return;};
+  if(meas.imu.empty() && imu_need_init_) {return;};
   assert(meas.lidar != nullptr);
 
   if (imu_need_init_)
