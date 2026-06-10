@@ -493,6 +493,9 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
+  pcl_un_->clear();
+  if (multi_lidar) { pcl_L1_out->clear(); pcl_L2_out->clear(); }
+
   if(meas.imu.empty()) {return;};
   assert(meas.lidar != nullptr);
 
