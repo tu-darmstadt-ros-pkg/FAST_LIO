@@ -13,11 +13,12 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
 enum LID_TYPE
 {
-  AVIA = 1,
-  VELO16,
-  OUST64,
-  MID360,
-  AVIA_PC2
+  LIVOX_CUSTOM = 1,  // livox_ros_driver2::msg::CustomMsg
+  VELODYNE,          // velodyne_ros::Point (x,y,z,intensity,time,ring)
+  OUSTER,            // ouster_ros::Point (x,y,z,intensity,t,reflectivity,ring,ambient,range)
+  XYZRTL,            // livox_ros::LivoxPointXyzrtl (x,y,z,reflectivity,tag,line — no per-point time)
+  XYZRTLO_AVIA,      // pcl::PointXYZRO + Avia scan-line grouping & duplicate filtering
+  XYZRTLO            // pcl::PointXYZRO, simple (offset_time used directly)
 };
 enum TIME_UNIT
 {
@@ -178,11 +179,12 @@ class Preprocess
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
-  void avia_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg);
-  void avia_pc2_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
-  void oust64_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void livox_custom_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg);
+  void xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void ouster_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
-  void mid360_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void xyzrtl_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void xyzrtlo_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void default_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const rclcpp::Time &ct);

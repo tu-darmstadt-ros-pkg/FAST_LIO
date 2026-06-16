@@ -1166,7 +1166,7 @@ public:
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("preprocess.blind", 0.01);
-        this->declare_parameter<int>("preprocess.lidar_type", AVIA);
+        this->declare_parameter<int>("preprocess.lidar_type", LIVOX_CUSTOM);
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
@@ -1184,7 +1184,7 @@ public:
         this->declare_parameter<bool>("common.multi_lidar", false);
         this->declare_parameter<int>("common.update_mode", 0);
         this->declare_parameter<string>("common.lid_topic2", "/livox/lidar2");
-        this->declare_parameter<int>("preprocess.lidar_type2", AVIA);
+        this->declare_parameter<int>("preprocess.lidar_type2", LIVOX_CUSTOM);
         this->declare_parameter<int>("preprocess.scan_line2", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit2", US);
         this->declare_parameter<int>("preprocess.scan_rate2", 10);
@@ -1238,7 +1238,7 @@ public:
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
-        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
+        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, LIVOX_CUSTOM);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
@@ -1256,8 +1256,8 @@ public:
         this->get_parameter_or<bool>("common.multi_lidar", multi_lidar, false);
         this->get_parameter_or<int>("common.update_mode", update_mode, 0);
         this->get_parameter_or<string>("common.lid_topic2", lid_topic2, "/livox/lidar2");
-        int lidar_type2 = AVIA;
-        this->get_parameter_or<int>("preprocess.lidar_type2", lidar_type2, AVIA);
+        int lidar_type2 = LIVOX_CUSTOM;
+        this->get_parameter_or<int>("preprocess.lidar_type2", lidar_type2, LIVOX_CUSTOM);
         this->get_parameter_or<int>("preprocess.scan_line2", p_pre2->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit2", p_pre2->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate2", p_pre2->SCAN_RATE, 10);
@@ -1290,12 +1290,10 @@ public:
         _featsArray.reset(new PointCloudXYZI());
 
         memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
+        std::fill(std::begin(res_last), std::end(res_last), -1000.0f);
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
         mapPubVoxelFilter.setLeafSize(map_voxel_filter_size, map_voxel_filter_size, map_voxel_filter_size);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
 
         if (extrinT.size() < 3) extrinT = {0.0, 0.0, 0.0};
         if (extrinR.size() < 9) extrinR = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
@@ -1368,7 +1366,7 @@ public:
         rclcpp::SubscriptionOptions lidar_sub_options;
         lidar_sub_options.callback_group = lidar1_cbg_;
 
-        if (p_pre->lidar_type == AVIA)
+        if (p_pre->lidar_type == LIVOX_CUSTOM)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, std::bind(&LaserMappingNode::livox_pcl_cbk, this, std::placeholders::_1), lidar_sub_options);
         }
@@ -1382,7 +1380,7 @@ public:
         {
             rclcpp::SubscriptionOptions lidar2_sub_options;
             lidar2_sub_options.callback_group = lidar2_cbg_;
-            if (p_pre2->lidar_type == AVIA)
+            if (p_pre2->lidar_type == LIVOX_CUSTOM)
             {
                 sub_pcl_livox2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic2, 20, std::bind(&LaserMappingNode::livox_pcl_cbk2, this, std::placeholders::_1), lidar2_sub_options);
             }
@@ -1971,7 +1969,7 @@ private:
 
         // === Reset Arrays ===
         memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
+        std::fill(std::begin(res_last), std::end(res_last), -1000.0f);
 
         // === Reset Path ===
         path.poses.clear();
