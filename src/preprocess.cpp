@@ -5,7 +5,7 @@
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
-Preprocess::Preprocess() : feature_enabled(0), lidar_type(LIVOX_CUSTOM), blind(0.01), point_filter_num(1)
+Preprocess::Preprocess() : feature_enabled(0), lidar_type(LIVOX_CUSTOM), blind(0.01), point_filter_num(1), self_filtered(false)
 {
   inf_bound = 10;
   N_SCANS = 6;
@@ -191,7 +191,7 @@ void Preprocess::livox_custom_handler(const livox_ros_driver2::msg::CustomMsg::C
           if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7)
               || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
               || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
-              && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
+              && (self_filtered || pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
           {
             pl_surf.push_back(pl_full[i]);
           }
@@ -223,7 +223,7 @@ void Preprocess::ouster_handler(const sensor_msgs::msg::PointCloud2::ConstShared
     {
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
                      pl_orig.points[i].z * pl_orig.points[i].z;
-      if (range < (blind * blind))
+      if (!self_filtered && range < (blind * blind))
         continue;
       Eigen::Vector3d pt_vec;
       PointType added_pt;
@@ -280,7 +280,7 @@ void Preprocess::ouster_handler(const sensor_msgs::msg::PointCloud2::ConstShared
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
                      pl_orig.points[i].z * pl_orig.points[i].z;
 
-      if (range < (blind * blind))
+      if (!self_filtered && range < (blind * blind))
         continue;
 
       Eigen::Vector3d pt_vec;
@@ -472,7 +472,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::ConstShar
 
       if (i % point_filter_num == 0)
       {
-        if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+        if (self_filtered || added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
         {
           pl_surf.points.push_back(added_pt);
         }
@@ -547,7 +547,7 @@ void Preprocess::xyzrtl_handler(const sensor_msgs::msg::PointCloud2::ConstShared
     yaw_last[layer] = yaw_angle;
     time_last[layer] = added_pt.curvature;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (self_filtered || added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
     }
@@ -649,7 +649,7 @@ void Preprocess::xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::Const
           if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7)
               || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
               || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
-              && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
+              && (self_filtered || pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
           {
             pl_surf.push_back(pl_full[i]);
           }
@@ -692,7 +692,7 @@ void Preprocess::xyzrtlo_handler(const sensor_msgs::msg::PointCloud2::ConstShare
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
 
-      if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+      if (self_filtered || added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
       {
         pl_surf.push_back(added_pt);
       }
@@ -725,7 +725,7 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::ConstShare
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = 0.;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (self_filtered || added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
     }

@@ -1166,6 +1166,7 @@ public:
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("preprocess.blind", 0.01);
+        this->declare_parameter<bool>("preprocess.self_filtered", false);
         this->declare_parameter<int>("preprocess.lidar_type", LIVOX_CUSTOM);
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
@@ -1189,6 +1190,7 @@ public:
         this->declare_parameter<int>("preprocess.timestamp_unit2", US);
         this->declare_parameter<int>("preprocess.scan_rate2", 10);
         this->declare_parameter<double>("preprocess.blind2", 0.01);
+        this->declare_parameter<bool>("preprocess.self_filtered2", false);
         this->declare_parameter<int>("point_filter_num2", 2);
         this->declare_parameter<bool>("mapping.extrinsic_imu_to_lidars", false);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T2", vector<double>());
@@ -1238,6 +1240,7 @@ public:
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
+        this->get_parameter_or<bool>("preprocess.self_filtered", p_pre->self_filtered, false);
         this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, LIVOX_CUSTOM);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
@@ -1262,6 +1265,7 @@ public:
         this->get_parameter_or<int>("preprocess.timestamp_unit2", p_pre2->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate2", p_pre2->SCAN_RATE, 10);
         this->get_parameter_or<double>("preprocess.blind2", p_pre2->blind, 0.01);
+        this->get_parameter_or<bool>("preprocess.self_filtered2", p_pre2->self_filtered, false);
         this->get_parameter_or<int>("point_filter_num2", p_pre2->point_filter_num, 2);
         p_pre2->lidar_type = lidar_type2;
         this->get_parameter_or<bool>("mapping.extrinsic_imu_to_lidars", extrinsic_imu_to_lidars, false);
