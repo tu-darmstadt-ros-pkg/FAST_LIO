@@ -1630,7 +1630,13 @@ private:
             if (multi_lidar && update_mode == 1)
             {
                 if (last_async_lidar == 2)
+                {
+                    double l2_gap = Measures.lidar_beg_time - p_imu->get_lidar_end_time_L2();
+                    if (l2_gap > 0.5)
+                        printf("\033[1;33m[ASYNC] L2 scan: gap since last L2 = %.3fs  (l2_cursor=%.3f  now=%.3f)\n\033[0m",
+                               l2_gap, p_imu->get_lidar_end_time_L2(), Measures.lidar_beg_time);
                     p_imu->swap_lidar_end_time();
+                }
             }
             p_imu->Process(Measures, kf, feats_undistort, feats_undistort_L1, feats_undistort_L2, use_multi_undistort);
             if (multi_lidar && update_mode == 1)
@@ -1749,6 +1755,13 @@ private:
                     printf("============================================================\n");
                     printf("\033[0m\n");
                 }
+            }
+
+            {
+                double t_elapsed = Measures.lidar_beg_time - first_lidar_time;
+                if (t_elapsed < 60.0)
+                    printf("[STARTUP t=%5.2fs] feats_down=%-5d  effct=%-5d  L=%d\n",
+                           t_elapsed, feats_down_size, effct_feat_num, last_async_lidar);
             }
 
             euler_cur = SO3ToEuler(state_point.rot);

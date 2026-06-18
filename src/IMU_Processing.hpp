@@ -47,6 +47,7 @@ class ImuProcess
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
   void swap_lidar_end_time() { std::swap(last_lidar_end_time_, last_lidar_end_time_L2_); }
+  double get_lidar_end_time_L2() const { return last_lidar_end_time_L2_; }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, const PointCloudXYZI::Ptr& pcl_un_, const PointCloudXYZI::Ptr& pcl_L1_out, const PointCloudXYZI::Ptr& pcl_L2_out, const bool &multi_lidar = false);
 
@@ -85,7 +86,8 @@ class ImuProcess
 };
 
 ImuProcess::ImuProcess()
-    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
+    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1),
+      last_lidar_end_time_(0.0)
 {
   init_iter_num = 1;
   Q = process_noise_cov();
@@ -328,6 +330,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  if (fabs(dt) > 0.2)
+    printf("\033[1;33m[IMU] Large end-gap dt=%.3fs  pcl_end=%.3f  imu_end=%.3f  last_lidar_end=%.3f\n\033[0m",
+           dt, pcl_end_time, imu_end_time, last_lidar_end_time_);
   kf_state.predict(dt, Q, in);
 
   imu_state = kf_state.get_x();
@@ -465,6 +470,9 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  if (fabs(dt) > 0.2)
+    printf("\033[1;33m[IMU/multi] Large end-gap dt=%.3fs  pcl_end=%.3f  imu_end=%.3f  last_lidar_end=%.3f\n\033[0m",
+           dt, pcl_end_time, imu_end_time, last_lidar_end_time_);
   kf_state.predict(dt, Q, in);
 
   imu_state = kf_state.get_x();
