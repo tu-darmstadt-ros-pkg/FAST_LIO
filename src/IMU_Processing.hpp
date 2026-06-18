@@ -253,6 +253,14 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   const double &pcl_beg_time = meas.lidar_beg_time;
   const double &pcl_end_time = meas.lidar_end_time;
 
+  /*** skip gap IMU to avoid dead-reckoning over a sensor restart ***/
+  if (last_lidar_end_time_ > 0.0 && pcl_beg_time - last_lidar_end_time_ > 1.0)
+  {
+    printf("\033[1;33m[IMU] Gap %.3fs > 1s: skipping gap IMU, advancing cursor to scan start\n\033[0m",
+           pcl_beg_time - last_lidar_end_time_);
+    last_lidar_end_time_ = pcl_beg_time;
+  }
+
   /*** sort point clouds by offset time ***/
   pcl_in_out = *(meas.lidar);
   sort(pcl_in_out.points.begin(), pcl_in_out.points.end(), time_list);
@@ -392,6 +400,14 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   const double &imu_end_time = rclcpp::Time(v_imu.back()->header.stamp).seconds();
   const double pcl_beg_time = std::min(meas.lidar_beg_time, meas.lidar_beg_time2);
   const double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
+
+  /*** skip gap IMU to avoid dead-reckoning over a sensor restart ***/
+  if (last_lidar_end_time_ > 0.0 && pcl_beg_time - last_lidar_end_time_ > 1.0)
+  {
+    printf("\033[1;33m[IMU/multi] Gap %.3fs > 1s: skipping gap IMU, advancing cursor to scan start\n\033[0m",
+           pcl_beg_time - last_lidar_end_time_);
+    last_lidar_end_time_ = pcl_beg_time;
+  }
 
   /*** sort point clouds by offset time (adjust curvature relative to combined beg time) ***/
   *pcl_L1_out = *(meas.lidar);
