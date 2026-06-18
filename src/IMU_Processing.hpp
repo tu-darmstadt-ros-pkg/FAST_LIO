@@ -46,6 +46,7 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void swap_lidar_end_time() { std::swap(last_lidar_end_time_, last_lidar_end_time_L2_); }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, const PointCloudXYZI::Ptr& pcl_un_, const PointCloudXYZI::Ptr& pcl_L1_out, const PointCloudXYZI::Ptr& pcl_L2_out, const bool &multi_lidar = false);
 
@@ -77,6 +78,7 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  double last_lidar_end_time_L2_ = 0.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -94,6 +96,7 @@ ImuProcess::ImuProcess()
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
   angvel_last     = Zero3d;
+  acc_s_last      = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -103,13 +106,21 @@ ImuProcess::~ImuProcess() {}
 
 void ImuProcess::Reset()
 {
-  // ROS_WARN("Reset ImuProcess");
-  mean_acc      = V3D(0, 0, -1.0);
-  mean_gyr      = V3D(0, 0, 0);
-  angvel_last       = Zero3d;
-  imu_need_init_    = true;
-  start_timestamp_  = -1;
-  init_iter_num     = 1;
+  printf("\033[1;33m\n");
+  printf("############################################################\n");
+  printf("  IMU PROCESSOR RESET\n");
+  printf("############################################################\n");
+  printf("\033[0m\n");
+  mean_acc          = V3D(0, 0, -1.0);
+  mean_gyr          = V3D(0, 0, 0);
+  angvel_last          = Zero3d;
+  acc_s_last           = Zero3d;
+  imu_need_init_       = true;
+  b_first_frame_       = true;
+  start_timestamp_     = -1;
+  init_iter_num        = 1;
+  last_lidar_end_time_    = 0.0;
+  last_lidar_end_time_L2_ = 0.0;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
@@ -190,6 +201,25 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
     N ++;
   }
+  double acc_norm = mean_acc.norm();
+  if (fabs(acc_norm - G_m_s2) > 0.5)
+  {
+    printf("\033[1;31m\n");
+    printf("!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n");
+    printf("  IMU INIT WARNING: acc_norm=%.3f m/s^2  expected g=%.3f\n", acc_norm, G_m_s2);
+    printf("  Robot may be moving during init — gravity direction UNRELIABLE\n");
+    printf("!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n");
+    printf("\033[0m\n");
+  }
+  else
+  {
+    printf("\033[1;32m\n");
+    printf("============================================================\n");
+    printf("  IMU INIT OK: acc_norm=%.3f m/s^2  (g=%.3f)  grav dir good\n", acc_norm, G_m_s2);
+    printf("============================================================\n");
+    printf("\033[0m\n");
+  }
+
   state_ikfom init_state = kf_state.get_x();
   init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   
@@ -205,7 +235,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
   init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
-  init_P(21,21) = init_P(22,22) = 0.00001;
+  init_P(21,21) = init_P(22,22) = 0.001;
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 
@@ -261,7 +291,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
 
-    // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
+    if (!acc_avr.allFinite() || !angvel_avr.allFinite()) continue;
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
@@ -402,6 +432,8 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+
+    if (!acc_avr.allFinite() || !angvel_avr.allFinite()) continue;
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm();
 

@@ -11,8 +11,8 @@ Preprocess::Preprocess() : feature_enabled(0), lidar_type(LIVOX_CUSTOM), blind(0
   N_SCANS = 6;
   SCAN_RATE = 10;
   group_size = 8;
-  disA = 0.01;
-  disB = 0.1;
+  disA = 0.1;
+  disB = 0.05;
   p2l_ratio = 225;
   limit_maxmid = 6.25;
   limit_midmin = 6.25;

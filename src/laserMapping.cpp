@@ -195,8 +195,8 @@ shared_ptr<Preprocess> p_pre2(new Preprocess());
 
 void SigHandle(int sig)
 {
+    printf("\033[?1049l\n");  // restore main screen buffer
     flg_exit = true;
-    std::cout << "catch sig %d" << sig << std::endl;
     sig_buffer.notify_all();
     rclcpp::shutdown();
 }
@@ -1055,7 +1055,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (esti_plane(pabcd, points_near, 0.1f))
         {
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+            if (fabs(pd2) > 0.3f) continue;
+            float s = 1 - 0.9 * fabs(pd2) / p_body.norm();
 
             if (s > 0.9)
             {
@@ -1082,7 +1083,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
-    if (effct_feat_num < 1)
+    if (effct_feat_num < 20)
     {
         ekfom_data.valid = false;
         std::cerr << "No Effective Points!" << std::endl;
@@ -1439,6 +1440,7 @@ public:
 
     ~LaserMappingNode()
     {
+        printf("\033[?1049l\n");  // restore main screen buffer
         fout_out.close();
         fout_pre.close();
         fclose(fp);
@@ -1623,7 +1625,19 @@ private:
 
             // In async mode, each lidar is processed individually (no multi undistort needed)
             bool use_multi_undistort = multi_lidar && (update_mode == 0);
+            // Async mode: L1 and L2 have independent time cursors — swap in the right one
+            // so each lidar's IMU propagation doesn't bleed into the other's dt calculation.
+            if (multi_lidar && update_mode == 1)
+            {
+                if (last_async_lidar == 2)
+                    p_imu->swap_lidar_end_time();
+            }
             p_imu->Process(Measures, kf, feats_undistort, feats_undistort_L1, feats_undistort_L2, use_multi_undistort);
+            if (multi_lidar && update_mode == 1)
+            {
+                if (last_async_lidar == 2)
+                    p_imu->swap_lidar_end_time();
+            }
 
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1638,6 +1652,14 @@ private:
                             false : true;
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
+
+            /*** strip NaN points before voxel grid to prevent integer overflow ***/
+            {
+                PointCloudXYZI::Ptr feats_clean(new PointCloudXYZI());
+                std::vector<int> idx;
+                pcl::removeNaNFromPointCloud(*feats_undistort, *feats_clean, idx);
+                feats_undistort = feats_clean;
+            }
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1699,6 +1721,36 @@ private:
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
+
+            {
+                static bool grav_bad = false;
+                static V3D grav_ref(0, 0, 0);
+                V3D grav_cur(state_point.grav[0], state_point.grav[1], state_point.grav[2]);
+                double t = Measures.lidar_beg_time - first_lidar_time;
+                if (grav_ref.norm() < 1.0) grav_ref = grav_cur;  // latch on first valid scan
+                double grav_angle_deg = std::acos(std::max(-1.0, std::min(1.0,
+                    grav_ref.dot(grav_cur) / (grav_ref.norm() * grav_cur.norm())))) * 57.3;
+                if (!grav_bad && grav_angle_deg > 5.0)
+                {
+                    grav_bad = true;
+                    printf("\033[1;31m\n");
+                    printf("!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n");
+                    printf("  GRAVITY DIRECTION DIVERGING  t=%.3fs  angle_from_init=%.2f deg\n", t, grav_angle_deg);
+                    printf("  grav=(%.3f, %.3f, %.3f)\n", grav_cur(0), grav_cur(1), grav_cur(2));
+                    printf("!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n");
+                    printf("\033[0m\n");
+                }
+                else if (grav_bad && grav_angle_deg <= 5.0)
+                {
+                    grav_bad = false;
+                    printf("\033[1;32m\n");
+                    printf("============================================================\n");
+                    printf("  GRAVITY DIRECTION RECOVERED  t=%.3fs  angle_from_init=%.2f deg\n", t, grav_angle_deg);
+                    printf("============================================================\n");
+                    printf("\033[0m\n");
+                }
+            }
+
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
@@ -1870,8 +1922,7 @@ private:
 
     void state_reset_callback(const std_srvs::srv::Trigger::Request::ConstSharedPtr &req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_WARN(this->get_logger(), "State reset requested via service call. Resetting filter state and clearing map...");
-
+        RCLCPP_INFO_STREAM(this->get_logger(), "RESETTING" << Lidar2_T_wrt_L1.transpose());
         mtx_buffer.lock();
 
         // === Reset Message Counters ===
@@ -2076,7 +2127,7 @@ private:
         double dist_to_origin = cur_pos.norm();
 
         // Clear terminal and print status
-        printf("\033[2J\033[1;1H");
+        //printf("\033[2J\033[1;1H");
         std::cout << std::endl;
         std::string mode_str = multi_lidar ? (update_mode == 1 ? " ASYNC" : " BUNDLE") : "";
         std::cout << "==== FAST-LIO" << mode_str << " ====" << std::endl;
@@ -2105,7 +2156,7 @@ private:
         std::cout << "  Points (down) :: " << std::setfill(' ') << std::setw(7) << feats_down_size << std::endl;
         std::cout << "  Eff. Features :: " << std::setfill(' ') << std::setw(7) << effct_feat_num << std::endl;
         std::cout << "  Map Size      :: " << std::setfill(' ') << std::setw(7) << ikdtree.size() << std::endl;
-        std::cout << std::flush;
+        //std::cout << std::flush;
     }
 
     FILE *fp;
