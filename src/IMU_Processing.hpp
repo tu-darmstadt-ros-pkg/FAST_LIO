@@ -48,9 +48,9 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   void swap_lidar_end_time() { std::swap(last_lidar_end_time_, last_lidar_end_time_L2_); }
   double get_lidar_end_time_L2() const { return last_lidar_end_time_L2_; }
+  void reset_lidar_end_time_L2(double t) { last_lidar_end_time_L2_ = t; }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, const PointCloudXYZI::Ptr& pcl_un_, const PointCloudXYZI::Ptr& pcl_L1_out, const PointCloudXYZI::Ptr& pcl_L2_out, const bool &multi_lidar = false);
-
   ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;
@@ -237,7 +237,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
   init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
-  init_P(21,21) = init_P(22,22) = 0.001;
+  init_P(21,21) = init_P(22,22) = 0.00001;
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 

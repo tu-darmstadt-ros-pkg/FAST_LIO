@@ -1452,7 +1452,7 @@ private:
     {
         lidar_frame = msg->header.frame_id;
         new_lidar_frame = true;
-        double cur_time = get_time_sec(msg->header.stamp);
+        double cur_time = get_time_sec(msg->header.stamp) - time_diff_lidar_to_imu;
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
         double preprocess_start_time = omp_get_wtime();
         p_pre->process(msg, ptr);
@@ -1538,7 +1538,7 @@ private:
     /*** Second LiDAR callbacks ***/
     void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
     {
-        double cur_time = get_time_sec(msg->header.stamp);
+        double cur_time = get_time_sec(msg->header.stamp) - time_diff_lidar_to_imu;
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
         p_pre2->process(msg, ptr);
 
@@ -1632,7 +1632,7 @@ private:
                 if (last_async_lidar == 2)
                 {
                     double l2_gap = Measures.lidar_beg_time - p_imu->get_lidar_end_time_L2();
-                    if (l2_gap > 0.5)
+                    if (l2_gap > 0.5 && p_imu->get_lidar_end_time_L2() > 0.0)
                         printf("\033[1;33m[ASYNC] L2 scan: gap since last L2 = %.3fs  (l2_cursor=%.3f  now=%.3f)\n\033[0m",
                                l2_gap, p_imu->get_lidar_end_time_L2(), Measures.lidar_beg_time);
                     p_imu->swap_lidar_end_time();
