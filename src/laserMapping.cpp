@@ -47,6 +47,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
+#include "pose_undistorter.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -192,6 +193,21 @@ string lidar_frame2;
 V3D Lidar2_T_wrt_L1(Zero3d);
 M3D Lidar2_R_wrt_L1(Eye3d);
 shared_ptr<Preprocess> p_pre2(new Preprocess());
+
+// ---- SLERP HQ secondary output ----
+// When publish_hq_cloud is enabled, each scan's raw cloud (with per-point
+// timestamps in curvature) is queued here.  Scans are published one by one
+// once the SLAM pose buffer brackets the scan's time window.  The output is
+// in L1/IMU frame at the scan-end reference time.
+struct HqPending {
+    PointCloudXYZI::ConstPtr cloud;  // raw cloud (already in L1 frame)
+    double t_beg;
+    double t_end;
+    std::string frame_id;
+    bool suppress;
+    int lidar_id;  // 1 or 2
+};
+static constexpr size_t kMaxHqPending = 30;
 
 void SigHandle(int sig)
 {
@@ -1146,6 +1162,10 @@ public:
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<double>("publish.map_voxelfilter_size", 0.0);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.publish_hq_cloud", false);
+        this->declare_parameter<double>("publish.hq_angular_vel_threshold", 1.0);
+        this->declare_parameter<double>("publish.hq_linear_accel_threshold", 8.0);
+        this->declare_parameter<double>("publish.hq_slerp_max_range", 0.6);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1208,6 +1228,10 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.publish_hq_cloud", publish_hq_cloud_, false);
+        this->get_parameter_or<double>("publish.hq_angular_vel_threshold", hq_angular_vel_threshold_, 1.0);
+        this->get_parameter_or<double>("publish.hq_linear_accel_threshold", hq_linear_accel_threshold_, 8.0);
+        this->get_parameter_or<double>("publish.hq_slerp_max_range", hq_slerp_max_range_, 0.6);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -1408,6 +1432,11 @@ public:
         pubLaserCloud_L2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L2", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
+        if (publish_hq_cloud_) {
+            pubLaserCloud_L1_hq_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L1_hq", 20);
+            pubLaserCloud_L2_hq_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L2_hq", 20);
+            RCLCPP_INFO(this->get_logger(), "SLERP HQ output enabled on cloud_registered_L1_hq / cloud_registered_L2_hq");
+        }
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("path", 20);
         pubDiagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("diagnostics", 10);
@@ -1727,6 +1756,8 @@ private:
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
+            p_imu->setAnchorPose(state_point.pos, state_point.rot.toRotationMatrix(),
+                                 state_point.vel, Measures.lidar_end_time);
 
             {
                 static bool grav_bad = false;
@@ -1799,6 +1830,100 @@ private:
                 }
             }
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+
+            /*** SLERP HQ secondary output ***/
+            if (publish_hq_cloud_) {
+                // Add post-ICP SLAM pose to buffer
+                hq_pose_undistorter_.addPose(
+                    Measures.lidar_end_time,
+                    Eigen::Quaterniond(state_point.rot),
+                    state_point.pos);
+
+                // Queue the raw scan(s) for deferred HQ processing.
+                // Both L1 and L2 clouds are already in L1 frame by this point
+                // (L2-to-L1 transform was applied in sync_packages), so both
+                // use the L1-to-IMU extrinsic for SLERP.
+                const M3D R_LI = state_point.offset_R_L_I.toRotationMatrix();
+                const V3D t_LI = state_point.offset_T_L_I;
+
+                // Determine which lidar(s) fired this iteration
+                const bool is_l2_async = (multi_lidar && update_mode == 1 && last_async_lidar == 2);
+                const int scan_id = is_l2_async ? 2 : 1;
+
+                // Compute peak IMU motion during this scan for HQ suppress decision
+                const bool suppress_hq = [&]() -> bool {
+                    V3D g_world(state_point.grav[0], state_point.grav[1], state_point.grav[2]);
+                    V3D g_imu = flg_EKF_inited
+                        ? V3D(state_point.rot.toRotationMatrix().transpose() * g_world)
+                        : V3D(0.0, 0.0, -G_m_s2);
+                    double omega_peak = 0.0, a_lin_peak = 0.0;
+                    for (const auto& imu_msg : Measures.imu) {
+                        const auto& ar = imu_msg->linear_acceleration;
+                        const auto& wr = imu_msg->angular_velocity;
+                        omega_peak  = std::max(omega_peak,  V3D(wr.x, wr.y, wr.z).norm());
+                        a_lin_peak  = std::max(a_lin_peak,  (V3D(ar.x, ar.y, ar.z) + g_imu).norm());
+                    }
+                    const double scan_dur = Measures.lidar_end_time - Measures.lidar_beg_time;
+                    const double slerp_score = omega_peak * scan_dur * hq_slerp_max_range_
+                                             + 0.5 * a_lin_peak * scan_dur * scan_dur;
+                    const bool suppress =
+                        (hq_angular_vel_threshold_  > 0.0 && omega_peak   > hq_angular_vel_threshold_) ||
+                        (hq_linear_accel_threshold_ > 0.0 && a_lin_peak   > hq_linear_accel_threshold_) ||
+                        (hq_slerp_max_range_        > 0.0 && slerp_score  > hq_slerp_max_range_);
+                    if (suppress)
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                             "HQ suppressed: w=%.2f rad/s  a_lin=%.2f m/s2  score=%.3f m",
+                                             omega_peak, a_lin_peak, slerp_score);
+                    return suppress;
+                }();
+
+                if (hq_pending_.size() < kMaxHqPending) {
+                    hq_pending_.push_back({Measures.lidar, Measures.lidar_beg_time,
+                                           lidar_end_time, lidar_frame, suppress_hq,
+                                           scan_id});
+                }
+                // Bundle mode: also queue L2 separately
+                if (multi_lidar && update_mode == 0 && Measures.lidar2 && !Measures.lidar2->empty()) {
+                    if (hq_pending_.size() < kMaxHqPending) {
+                        hq_pending_.push_back({Measures.lidar2, Measures.lidar_beg_time2,
+                                               lidar_end_time2, lidar_frame, suppress_hq, 2});
+                    }
+                }
+
+                // Process all scans whose time window is now bracketed by SLAM poses
+                while (!hq_pending_.empty()) {
+                    auto& front = hq_pending_.front();
+                    if (!hq_pose_undistorter_.hasCoverage(front.t_beg, front.t_end)) {
+                        // We have a pose after t_end but none before t_beg (startup case:
+                        // no pose exists from before the very first scan). Discard and move on.
+                        if (hq_pose_undistorter_.newestStamp() > front.t_end) {
+                            hq_pending_.pop_front();
+                            continue;
+                        }
+                        break;
+                    }
+                    if (!front.suppress && front.cloud) {
+                        PointCloudXYZI hq_cloud = *front.cloud;
+                        sort(hq_cloud.points.begin(), hq_cloud.points.end(), time_list);
+                        if (hq_pose_undistorter_.undistort(hq_cloud, front.t_beg, front.t_end,
+                                                            R_LI, t_LI)) {
+                            sensor_msgs::msg::PointCloud2 hq_msg;
+                            pcl::toROSMsg(hq_cloud, hq_msg);
+                            hq_msg.header.frame_id = front.frame_id;
+                            hq_msg.header.stamp = get_ros_time(front.t_end);
+                            if (front.lidar_id == 1 && pubLaserCloud_L1_hq_)
+                                pubLaserCloud_L1_hq_->publish(hq_msg);
+                            else if (front.lidar_id == 2 && pubLaserCloud_L2_hq_)
+                                pubLaserCloud_L2_hq_->publish(hq_msg);
+                        }
+                    }
+                    hq_pending_.pop_front();
+                }
+
+                // Keep pose buffer bounded
+                if (!hq_pending_.empty())
+                    hq_pose_undistorter_.pruneBefore(hq_pending_.front().t_beg - 2.0);
+            }
 
             /*** Terminal status display (throttled to 5Hz) ***/
             auto now = std::chrono::steady_clock::now();
@@ -2044,8 +2169,11 @@ private:
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id = sensor_init_frame;
 
-        // === Reset IMU Processor ===
+        // === Reset IMU Processor and HQ state ===
         p_imu->Reset();
+        p_imu->clearAnchor();
+        hq_pose_undistorter_.clear();
+        hq_pending_.clear();
 
         mtx_buffer.unlock();
 
@@ -2098,6 +2226,9 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L2_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
+    // SLERP HQ publishers (optional, only created when publish_hq_cloud is true)
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L1_hq_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L2_hq_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
@@ -2133,6 +2264,14 @@ private:
     const std::chrono::milliseconds print_status_throttle_interval{200}; // 5Hz throttle
     double epsi[23] = {0.001};
     double map_voxel_filter_size = 0.25, map_pub_interval = 2.0;
+
+    // SLERP HQ secondary output state
+    bool publish_hq_cloud_ = false;
+    double hq_angular_vel_threshold_ = 0.5;
+    double hq_linear_accel_threshold_ = 5.0;
+    double hq_slerp_max_range_ = 0.6;
+    PoseUndistorter hq_pose_undistorter_;
+    std::deque<HqPending> hq_pending_;
 
     void print_status(double frame_time)
     {

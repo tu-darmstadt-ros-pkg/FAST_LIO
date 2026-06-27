@@ -35,7 +35,7 @@ class ImuProcess
 
   ImuProcess();
   ~ImuProcess();
-  
+
   void Reset();
   // void Reset(double start_timestamp, const sensor_msgs::ImuConstPtr &lastimu);
   void Reset(double start_timestamp, const sensor_msgs::msg::Imu::ConstSharedPtr &lastimu);
@@ -60,6 +60,19 @@ class ImuProcess
   V3D cov_bias_acc;
   double first_lidar_time;
 
+  bool is_initialized() const { return !imu_need_init_; }
+
+  // Anchor the undistortion EKF to the latest SLAM result (pos/rot/vel only;
+  // biases and gravity are preserved from the running EKF).  Called after each
+  // ICP update so that the next scan's IMU integration starts from the corrected
+  // SLAM state rather than accumulating prediction error across scans.
+  void setAnchorPose(const V3D &pos, const M3D &rot, const V3D &vel, double stamp);
+  void clearAnchor();
+  double anchor_stamp() const {
+    std::lock_guard<std::mutex> l(anchor_mutex_);
+    return anchor_stamp_;
+  }
+
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
@@ -83,6 +96,14 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+
+  // Anchor pose set after each ICP update (protected by anchor_mutex_).
+  mutable std::mutex anchor_mutex_;
+  bool   anchor_valid_  = false;
+  V3D    anchor_pos_    = Zero3d;
+  M3D    anchor_rot_    = Eye3d;
+  V3D    anchor_vel_    = Zero3d;
+  double anchor_stamp_  = -1.0;
 };
 
 ImuProcess::ImuProcess()
@@ -105,6 +126,22 @@ ImuProcess::ImuProcess()
 }
 
 ImuProcess::~ImuProcess() {}
+
+void ImuProcess::setAnchorPose(const V3D &pos, const M3D &rot, const V3D &vel, double stamp)
+{
+  std::lock_guard<std::mutex> lock(anchor_mutex_);
+  anchor_pos_   = pos;
+  anchor_rot_   = rot;
+  anchor_vel_   = vel;
+  anchor_stamp_ = stamp;
+  anchor_valid_ = true;
+}
+
+void ImuProcess::clearAnchor()
+{
+  std::lock_guard<std::mutex> lock(anchor_mutex_);
+  anchor_valid_ = false;
+}
 
 void ImuProcess::Reset()
 {
@@ -267,6 +304,20 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
   //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
 
+  /*** Reset EKF pos/rot/vel to the post-ICP anchor so each scan's integration
+   *   starts from the corrected SLAM state (biases and gravity are preserved). ***/
+  {
+    std::lock_guard<std::mutex> lock(anchor_mutex_);
+    if (anchor_valid_)
+    {
+      state_ikfom s = kf_state.get_x();
+      s.pos = anchor_pos_;
+      s.rot = anchor_rot_;
+      s.vel = anchor_vel_;
+      kf_state.change_x(s);
+    }
+  }
+
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
@@ -421,6 +472,19 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
   sort(pcl_L1_out->points.begin(), pcl_L1_out->points.end(), time_list);
   sort(pcl_L2_out->points.begin(), pcl_L2_out->points.end(), time_list);
+
+  /*** Reset EKF pos/rot/vel to the post-ICP anchor (see UndistortPcl for rationale) ***/
+  {
+    std::lock_guard<std::mutex> lock(anchor_mutex_);
+    if (anchor_valid_)
+    {
+      state_ikfom s = kf_state.get_x();
+      s.pos = anchor_pos_;
+      s.rot = anchor_rot_;
+      s.vel = anchor_vel_;
+      kf_state.change_x(s);
+    }
+  }
 
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
