@@ -47,11 +47,11 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
-#include "pose_undistorter.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <fast_lio/msg/motion_diagnostics.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -78,8 +78,6 @@
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
-
-// TODO gravitiy alignment!
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -171,6 +169,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 /*** Multi-LiDAR variables ***/
 bool   multi_lidar = false;
+bool   passive_secondary = false;
 int    update_mode = 0;    // 0=bundle, 1=async
 int    last_async_lidar = 0;  // which lidar was last processed in async mode (1 or 2)
 string lid_topic2;
@@ -194,20 +193,14 @@ V3D Lidar2_T_wrt_L1(Zero3d);
 M3D Lidar2_R_wrt_L1(Eye3d);
 shared_ptr<Preprocess> p_pre2(new Preprocess());
 
-// ---- SLERP HQ secondary output ----
-// When publish_hq_cloud is enabled, each scan's raw cloud (with per-point
-// timestamps in curvature) is queued here.  Scans are published one by one
-// once the SLAM pose buffer brackets the scan's time window.  The output is
-// in L1/IMU frame at the scan-end reference time.
-struct HqPending {
-    PointCloudXYZI::ConstPtr cloud;  // raw cloud (already in L1 frame)
-    double t_beg;
-    double t_end;
-    std::string frame_id;
-    bool suppress;
-    int lidar_id;  // 1 or 2
-};
-static constexpr size_t kMaxHqPending = 30;
+// Full-resolution preprocessors (point_filter_num=1) for the async undistorted output.
+shared_ptr<Preprocess> p_pre_full(new Preprocess());
+shared_ptr<Preprocess> p_pre_full2(new Preprocess());
+deque<PointCloudXYZI::Ptr> full_lidar_buffer;
+deque<PointCloudXYZI::Ptr> full_lidar_buffer2;
+// Set by the sync functions, consumed by the timer callback.
+PointCloudXYZI::Ptr current_full_cloud_L1;
+PointCloudXYZI::Ptr current_full_cloud_L2;
 
 void SigHandle(int sig)
 {
@@ -437,6 +430,9 @@ bool sync_packages(MeasureGroup &meas)
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
+    current_full_cloud_L1 = full_lidar_buffer.empty() ? nullptr : full_lidar_buffer.front();
+    if (!full_lidar_buffer.empty()) full_lidar_buffer.pop_front();
+    current_full_cloud_L2 = nullptr;
     lidar_pushed = false;
     return true;
 }
@@ -534,6 +530,19 @@ bool sync_packages_multi(MeasureGroup &meas)
     time_buffer.pop_front();
     lidar_buffer2.pop_front();
     time_buffer2.pop_front();
+    current_full_cloud_L1 = full_lidar_buffer.empty() ? nullptr : full_lidar_buffer.front();
+    if (!full_lidar_buffer.empty()) full_lidar_buffer.pop_front();
+    if (!full_lidar_buffer2.empty()) {
+        current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
+        full_lidar_buffer2.pop_front();
+        // Transform L2 full-res cloud to L1 frame (matches what sync_packages_multi does to meas.lidar2)
+        for (auto& pt : current_full_cloud_L2->points) {
+            V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
+            pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+        }
+    } else {
+        current_full_cloud_L2 = nullptr;
+    }
     lidar_pushed = false;
     lidar_pushed2 = false;
     return true;
@@ -605,6 +614,9 @@ bool sync_packages_async(MeasureGroup &meas)
 
         lidar_buffer.pop_front();
         time_buffer.pop_front();
+        current_full_cloud_L1 = full_lidar_buffer.empty() ? nullptr : full_lidar_buffer.front();
+        if (!full_lidar_buffer.empty()) full_lidar_buffer.pop_front();
+        current_full_cloud_L2 = nullptr;
         lidar_pushed = false;
         last_async_lidar = 1;
         return true;
@@ -665,6 +677,18 @@ bool sync_packages_async(MeasureGroup &meas)
 
         lidar_buffer2.pop_front();
         time_buffer2.pop_front();
+        current_full_cloud_L1 = nullptr;
+        if (!full_lidar_buffer2.empty()) {
+            current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
+            full_lidar_buffer2.pop_front();
+            // Transform L2 full-res cloud to L1 frame
+            for (auto& pt : current_full_cloud_L2->points) {
+                V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
+                pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+            }
+        } else {
+            current_full_cloud_L2 = nullptr;
+        }
         lidar_pushed2 = false;
         last_async_lidar = 2;
         return true;
@@ -1162,10 +1186,6 @@ public:
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<double>("publish.map_voxelfilter_size", 0.0);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-        this->declare_parameter<bool>("publish.publish_hq_cloud", false);
-        this->declare_parameter<double>("publish.hq_angular_vel_threshold", 1.0);
-        this->declare_parameter<double>("publish.hq_linear_accel_threshold", 8.0);
-        this->declare_parameter<double>("publish.hq_slerp_max_range", 0.6);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -1196,6 +1216,10 @@ public:
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("diagnostics_enable", false);
+        this->declare_parameter<bool>("use_odom_anchor", false);
+        this->declare_parameter<double>("odom_anchor_timeout", 0.5);
+        this->declare_parameter<std::string>("odom_topic", std::string("Odometry"));
+        this->declare_parameter<double>("slerp_max_range", 10.0);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
@@ -1204,6 +1228,7 @@ public:
 
         /*** Multi-LiDAR parameter declarations ***/
         this->declare_parameter<bool>("common.multi_lidar", false);
+        this->declare_parameter<bool>("common.passive_secondary", false);
         this->declare_parameter<int>("common.update_mode", 0);
         this->declare_parameter<string>("common.lid_topic2", "/livox/lidar2");
         this->declare_parameter<int>("preprocess.lidar_type2", LIVOX_CUSTOM);
@@ -1228,10 +1253,6 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-        this->get_parameter_or<bool>("publish.publish_hq_cloud", publish_hq_cloud_, false);
-        this->get_parameter_or<double>("publish.hq_angular_vel_threshold", hq_angular_vel_threshold_, 1.0);
-        this->get_parameter_or<double>("publish.hq_linear_accel_threshold", hq_linear_accel_threshold_, 8.0);
-        this->get_parameter_or<double>("publish.hq_slerp_max_range", hq_slerp_max_range_, 0.6);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -1282,6 +1303,7 @@ public:
 
         /*** Multi-LiDAR parameter reads ***/
         this->get_parameter_or<bool>("common.multi_lidar", multi_lidar, false);
+        this->get_parameter_or<bool>("common.passive_secondary", passive_secondary, false);
         this->get_parameter_or<int>("common.update_mode", update_mode, 0);
         this->get_parameter_or<string>("common.lid_topic2", lid_topic2, "/livox/lidar2");
         int lidar_type2 = LIVOX_CUSTOM;
@@ -1301,6 +1323,9 @@ public:
         if (multi_lidar)
             RCLCPP_INFO(this->get_logger(), "Multi-LiDAR mode ENABLED (%s). L1: %s, L2: %s",
                         update_mode == 1 ? "ASYNC" : "BUNDLE", lid_topic.c_str(), lid_topic2.c_str());
+        else if (passive_secondary)
+            RCLCPP_INFO(this->get_logger(), "Passive-secondary mode. L1 (SLAM): %s, L2 (publish only): %s",
+                        lid_topic.c_str(), lid_topic2.c_str());
         else
             RCLCPP_INFO(this->get_logger(), "Single-LiDAR mode. Topic: %s", lid_topic.c_str());
 
@@ -1331,7 +1356,7 @@ public:
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
 
         /*** Compute L2 wrt L1 extrinsic ***/
-        if (multi_lidar)
+        if (multi_lidar || passive_secondary)
         {
             if (extrinsic_imu_to_lidars && extrinT2.size() >= 3 && extrinR2.size() >= 9)
             {
@@ -1369,6 +1394,15 @@ public:
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
+        // Set up full-res preprocessors: copy all settings from p_pre/p_pre2 then force point_filter_num=1.
+        *p_pre_full  = *p_pre;   p_pre_full->point_filter_num  = 1;
+        *p_pre_full2 = *p_pre2;  p_pre_full2->point_filter_num = 1;
+
+        this->get_parameter_or<bool>("use_odom_anchor", use_odom_anchor_, false);
+        this->get_parameter_or<double>("odom_anchor_timeout", odom_anchor_timeout_, 0.5);
+        this->get_parameter_or<std::string>("odom_topic", odom_topic_, std::string("Odometry"));
+        this->get_parameter_or<double>("slerp_max_range", slerp_max_range_, 10.0);
+
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
@@ -1390,6 +1424,7 @@ public:
         lidar1_cbg_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         lidar2_cbg_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         imu_cbg_    = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        odom_cbg_   = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         /*** ROS subscribe initialization ***/
         rclcpp::SubscriptionOptions lidar_sub_options;
@@ -1404,8 +1439,8 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), std::bind(&LaserMappingNode::standard_pcl_cbk, this, std::placeholders::_1), lidar_sub_options);
         }
 
-        /*** Second LiDAR subscriber (if multi-lidar enabled) ***/
-        if (multi_lidar)
+        /*** Second LiDAR subscriber (if multi-lidar or passive-secondary enabled) ***/
+        if (multi_lidar || passive_secondary)
         {
             rclcpp::SubscriptionOptions lidar2_sub_options;
             lidar2_sub_options.callback_group = lidar2_cbg_;
@@ -1426,17 +1461,42 @@ public:
         sub_options.callback_group = imu_cbg_;
 
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sub_options);
+
+        if (use_odom_anchor_) {
+            rclcpp::SubscriptionOptions odom_sub_options;
+            odom_sub_options.callback_group = odom_cbg_;
+            sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                odom_topic_, 20,
+                [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+                    const auto& p = msg->pose.pose;
+                    const auto& v = msg->twist.twist.linear;
+                    Eigen::Quaterniond q(p.orientation.w, p.orientation.x,
+                                        p.orientation.y, p.orientation.z);
+                    p_imu->setAnchorPose(
+                        V3D(p.position.x, p.position.y, p.position.z),
+                        q.toRotationMatrix(),
+                        V3D(v.x, v.y, v.z),
+                        get_time_sec(msg->header.stamp));
+                },
+                odom_sub_options);
+            RCLCPP_INFO(this->get_logger(), "Odom anchor enabled, subscribed to: %s (timeout %.2fs)",
+                        odom_topic_.c_str(), odom_anchor_timeout_);
+        }
+
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_body", 20);
-        pubLaserCloud_L1_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L1", 20);
-        pubLaserCloud_L2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L2", 20);
+        if (multi_lidar || passive_secondary) {
+            pubLaserCloud_L1_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted_downsampled_L1", 20);
+            pubLaserCloud_L2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted_downsampled_L2", 20);
+            pubUndistortedL1_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted_L1", 20);
+            pubUndistortedL2_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted_L2", 20);
+        } else {
+            pubUndistorted_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted", 20);
+            pubUndistortedDownsampled_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("undistorted_downsampled", 20);
+        }
+        pubMotionDiag_ = this->create_publisher<fast_lio::msg::MotionDiagnostics>("motion_diagnostics", 10);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
-        if (publish_hq_cloud_) {
-            pubLaserCloud_L1_hq_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L1_hq", 20);
-            pubLaserCloud_L2_hq_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_L2_hq", 20);
-            RCLCPP_INFO(this->get_logger(), "SLERP HQ output enabled on cloud_registered_L1_hq / cloud_registered_L2_hq");
-        }
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("path", 20);
         pubDiagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("diagnostics", 10);
@@ -1457,7 +1517,7 @@ public:
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("~/map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), processing_callback_group_);
         state_reset_srv_ = this->create_service<std_srvs::srv::Trigger>("~/reset", std::bind(&LaserMappingNode::state_reset_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), processing_callback_group_);
 
-        if (multi_lidar && l2_extrinsic_from_tf) {
+        if ((multi_lidar || passive_secondary) && l2_extrinsic_from_tf) {
             tf_init_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(100),
                 std::bind(&LaserMappingNode::tf_resolve_callback, this),
@@ -1473,6 +1533,10 @@ public:
         fout_out.close();
         fout_pre.close();
         fclose(fp);
+        // Wait for any in-flight async full-res publish tasks before tearing down.
+        if (full_cloud_future_.valid())    full_cloud_future_.get();
+        if (full_cloud_future_L1_.valid()) full_cloud_future_L1_.get();
+        if (full_cloud_future_L2_.valid()) full_cloud_future_L2_.get();
     }
 
 private:
@@ -1483,8 +1547,10 @@ private:
         new_lidar_frame = true;
         double cur_time = get_time_sec(msg->header.stamp) - time_diff_lidar_to_imu;
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        PointCloudXYZI::Ptr ptr_full(new PointCloudXYZI());
         double preprocess_start_time = omp_get_wtime();
         p_pre->process(msg, ptr);
+        p_pre_full->process(msg, ptr_full);
         double preprocess_elapsed = omp_get_wtime() - preprocess_start_time;
 
         mtx_buffer.lock();
@@ -1494,6 +1560,7 @@ private:
         {
             std::cerr << "lidar loop back, clear buffer" << std::endl;
             lidar_buffer.clear();
+            full_lidar_buffer.clear();
         }
         if (is_first_lidar)
         {
@@ -1508,6 +1575,7 @@ private:
         }
         lidar_buffer.push_back(ptr);
         time_buffer.push_back(cur_time);
+        full_lidar_buffer.push_back(ptr_full);
         last_timestamp_lidar = cur_time;
         s_plot11[scan_count] = preprocess_elapsed;
         mtx_buffer.unlock();
@@ -1520,8 +1588,10 @@ private:
         new_lidar_frame = true;
         double cur_time = get_time_sec(msg->header.stamp);
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        PointCloudXYZI::Ptr ptr_full(new PointCloudXYZI());
         double preprocess_start_time = omp_get_wtime();
         p_pre->process(msg, ptr);
+        p_pre_full->process(msg, ptr_full);
         double preprocess_elapsed = omp_get_wtime() - preprocess_start_time;
 
         mtx_buffer.lock();
@@ -1531,6 +1601,7 @@ private:
         {
             std::cerr << "lidar loop back, clear buffer" << std::endl;
             lidar_buffer.clear();
+            full_lidar_buffer.clear();
         }
         if (is_first_lidar)
         {
@@ -1559,6 +1630,7 @@ private:
 
         lidar_buffer.push_back(ptr);
         time_buffer.push_back(last_timestamp_lidar);
+        full_lidar_buffer.push_back(ptr_full);
         s_plot11[scan_count] = preprocess_elapsed;
         mtx_buffer.unlock();
         sig_buffer.notify_all();
@@ -1569,7 +1641,9 @@ private:
     {
         double cur_time = get_time_sec(msg->header.stamp) - time_diff_lidar_to_imu;
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        PointCloudXYZI::Ptr ptr_full(new PointCloudXYZI());
         p_pre2->process(msg, ptr);
+        p_pre_full2->process(msg, ptr_full);
 
         mtx_buffer.lock();
         lidar2_msg_count++;
@@ -1577,6 +1651,7 @@ private:
         {
             std::cerr << "lidar2 loop back, clear buffer" << std::endl;
             lidar_buffer2.clear();
+            full_lidar_buffer2.clear();
         }
         if (is_first_lidar2)
         {
@@ -1586,6 +1661,7 @@ private:
         }
         lidar_buffer2.push_back(ptr);
         time_buffer2.push_back(cur_time);
+        full_lidar_buffer2.push_back(ptr_full);
         last_timestamp_lidar2 = cur_time;
         mtx_buffer.unlock();
         sig_buffer.notify_all();
@@ -1595,7 +1671,9 @@ private:
     {
         double cur_time = get_time_sec(msg->header.stamp);
         PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+        PointCloudXYZI::Ptr ptr_full(new PointCloudXYZI());
         p_pre2->process(msg, ptr);
+        p_pre_full2->process(msg, ptr_full);
 
         mtx_buffer.lock();
         lidar2_msg_count++;
@@ -1603,6 +1681,7 @@ private:
         {
             std::cerr << "lidar2 loop back, clear buffer" << std::endl;
             lidar_buffer2.clear();
+            full_lidar_buffer2.clear();
         }
         if (is_first_lidar2)
         {
@@ -1613,6 +1692,7 @@ private:
         last_timestamp_lidar2 = cur_time;
         lidar_buffer2.push_back(ptr);
         time_buffer2.push_back(last_timestamp_lidar2);
+        full_lidar_buffer2.push_back(ptr_full);
         mtx_buffer.unlock();
         sig_buffer.notify_all();
     }
@@ -1623,15 +1703,17 @@ private:
       while (keep_processing)
       {
         bool synced = false;
-        if (multi_lidar) {
-            synced = (update_mode == 1) ? sync_packages_async(Measures) : sync_packages_multi(Measures);
+        if (multi_lidar || passive_secondary) {
+            // passive_secondary always uses bundle; multi_lidar may use async
+            synced = (multi_lidar && update_mode == 1)
+                ? sync_packages_async(Measures) : sync_packages_multi(Measures);
         } else {
             synced = sync_packages(Measures);
         }
         if (!synced) break;
         {
             /*** Wait for L2 extrinsic resolution before processing (resolved by tf_init_timer_) ***/
-            if (multi_lidar && l2_extrinsic_from_tf && !l2_extrinsic_resolved)
+            if ((multi_lidar || passive_secondary) && l2_extrinsic_from_tf && !l2_extrinsic_resolved)
             {
                 break;
             }
@@ -1652,8 +1734,20 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
-            // In async mode, each lidar is processed individually (no multi undistort needed)
-            bool use_multi_undistort = multi_lidar && (update_mode == 0);
+            // Anchor freshness check: clear stale odom anchor before undistortion.
+            if (use_odom_anchor_) {
+                const double anchor_age = Measures.lidar_beg_time - p_imu->anchor_stamp();
+                if (p_imu->anchor_stamp() >= 0.0 && anchor_age > odom_anchor_timeout_) {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "Odom anchor %.2fs old (timeout %.2fs) — falling back to pure IMU integration",
+                        anchor_age, odom_anchor_timeout_);
+                    p_imu->clearAnchor();
+                }
+            }
+
+            // In async mode, each lidar is processed individually (no multi undistort needed).
+            // passive_secondary always uses bundle undistortion so both clouds are computed.
+            bool use_multi_undistort = (multi_lidar && (update_mode == 0)) || passive_secondary;
             // Async mode: L1 and L2 have independent time cursors — swap in the right one
             // so each lidar's IMU propagation doesn't bleed into the other's dt calculation.
             if (multi_lidar && update_mode == 1)
@@ -1667,7 +1761,67 @@ private:
                     p_imu->swap_lidar_end_time();
                 }
             }
+            // Motion diagnostics: compute per-scan accel/gyro stats in LiDAR frame.
+            if (!Measures.imu.empty()) {
+                state_ikfom ekf_s = kf.get_x();
+                V3D g_world(ekf_s.grav[0], ekf_s.grav[1], ekf_s.grav[2]);
+                V3D g_imu = p_imu->is_initialized()
+                    ? V3D(ekf_s.rot.toRotationMatrix().transpose() * g_world)
+                    : V3D(0.0, 0.0, -G_m_s2);
+                M3D R_LI = ekf_s.offset_R_L_I.toRotationMatrix();
+                const int n = static_cast<int>(Measures.imu.size());
+
+                double peak_lin[3]{}, peak_ang[3]{};
+                double lin_peak = 0.0, omega_peak = 0.0;
+                double lin_sum = 0.0, omega_sum = 0.0, omega_sq_sum = 0.0;
+                for (const auto& imu_msg : Measures.imu) {
+                    const auto& ar = imu_msg->linear_acceleration;
+                    const auto& wr = imu_msg->angular_velocity;
+                    const V3D a_true = V3D(ar.x, ar.y, ar.z) + g_imu;
+                    const V3D omega(wr.x, wr.y, wr.z);
+                    const V3D a_lidar = R_LI * a_true;
+                    const V3D w_lidar = R_LI * omega;
+                    const double a_mag = a_true.norm();
+                    const double w_mag = omega.norm();
+                    for (int i = 0; i < 3; i++) {
+                        peak_lin[i] = std::max(peak_lin[i], std::abs(a_lidar[i]));
+                        peak_ang[i] = std::max(peak_ang[i], std::abs(w_lidar[i]));
+                    }
+                    lin_peak  = std::max(lin_peak,  a_mag);
+                    omega_peak = std::max(omega_peak, w_mag);
+                    lin_sum      += a_mag;
+                    omega_sum    += w_mag;
+                    omega_sq_sum += w_mag * w_mag;
+                }
+                const double lin_avg   = lin_sum   / n;
+                const double omega_avg = omega_sum / n;
+                // Variance via E[X²] - (E[X])²; clamped to avoid fp noise below zero
+                const double omega_std = std::sqrt(std::max(0.0, omega_sq_sum / n - omega_avg * omega_avg));
+                const double scan_dur  = Measures.lidar_end_time - Measures.lidar_beg_time;
+                const double slerp_score = omega_std * scan_dur * slerp_max_range_
+                                         + 0.5 * lin_peak * scan_dur * scan_dur;
+
+                fast_lio::msg::MotionDiagnostics diag;
+                diag.header.stamp = get_ros_time(Measures.lidar_end_time);
+                diag.header.frame_id = lidar_frame;
+                diag.peak_accel.linear.x = peak_lin[0];
+                diag.peak_accel.linear.y = peak_lin[1];
+                diag.peak_accel.linear.z = peak_lin[2];
+                diag.peak_accel.angular.x = peak_ang[0];
+                diag.peak_accel.angular.y = peak_ang[1];
+                diag.peak_accel.angular.z = peak_ang[2];
+                diag.lin_mag_avg = lin_avg;
+                diag.lin_mag_max = lin_peak;
+                diag.omega_mag_avg = omega_avg;
+                diag.omega_mag_max = omega_peak;
+                diag.slerp_score = slerp_score;
+                pubMotionDiag_->publish(diag);
+            }
+
             p_imu->Process(Measures, kf, feats_undistort, feats_undistort_L1, feats_undistort_L2, use_multi_undistort);
+            // In passive_secondary mode only L1 is used for SLAM; L2 is published but not mapped.
+            if (passive_secondary)
+                feats_undistort = feats_undistort_L1;
             if (multi_lidar && update_mode == 1)
             {
                 if (last_async_lidar == 2)
@@ -1756,8 +1910,6 @@ private:
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
-            p_imu->setAnchorPose(state_point.pos, state_point.rot.toRotationMatrix(),
-                                 state_point.vel, Measures.lidar_end_time);
 
             {
                 static bool grav_bad = false;
@@ -1816,12 +1968,12 @@ private:
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-            if (multi_lidar && scan_pub_en) {
-                if (update_mode == 0) { // bundle mode
+            if ((multi_lidar || passive_secondary) && scan_pub_en) {
+                if ((multi_lidar && update_mode == 0) || passive_secondary) { // bundle mode
                     publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort_L1, lidar_frame);
                     publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2,
                         Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
-                } else { // async mode
+                } else { // async mode (multi_lidar only)
                     if (last_async_lidar == 1)
                         publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort, lidar_frame);
                     else
@@ -1829,101 +1981,72 @@ private:
                             Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
                 }
             }
-            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-
-            /*** SLERP HQ secondary output ***/
-            if (publish_hq_cloud_) {
-                // Add post-ICP SLAM pose to buffer
-                hq_pose_undistorter_.addPose(
-                    Measures.lidar_end_time,
-                    Eigen::Quaterniond(state_point.rot),
-                    state_point.pos);
-
-                // Queue the raw scan(s) for deferred HQ processing.
-                // Both L1 and L2 clouds are already in L1 frame by this point
-                // (L2-to-L1 transform was applied in sync_packages), so both
-                // use the L1-to-IMU extrinsic for SLERP.
-                const M3D R_LI = state_point.offset_R_L_I.toRotationMatrix();
-                const V3D t_LI = state_point.offset_T_L_I;
-
-                // Determine which lidar(s) fired this iteration
-                const bool is_l2_async = (multi_lidar && update_mode == 1 && last_async_lidar == 2);
-                const int scan_id = is_l2_async ? 2 : 1;
-
-                // Compute peak IMU motion during this scan for HQ suppress decision
-                const bool suppress_hq = [&]() -> bool {
-                    V3D g_world(state_point.grav[0], state_point.grav[1], state_point.grav[2]);
-                    V3D g_imu = flg_EKF_inited
-                        ? V3D(state_point.rot.toRotationMatrix().transpose() * g_world)
-                        : V3D(0.0, 0.0, -G_m_s2);
-                    double omega_peak = 0.0, a_lin_peak = 0.0;
-                    for (const auto& imu_msg : Measures.imu) {
-                        const auto& ar = imu_msg->linear_acceleration;
-                        const auto& wr = imu_msg->angular_velocity;
-                        omega_peak  = std::max(omega_peak,  V3D(wr.x, wr.y, wr.z).norm());
-                        a_lin_peak  = std::max(a_lin_peak,  (V3D(ar.x, ar.y, ar.z) + g_imu).norm());
-                    }
-                    const double scan_dur = Measures.lidar_end_time - Measures.lidar_beg_time;
-                    const double slerp_score = omega_peak * scan_dur * hq_slerp_max_range_
-                                             + 0.5 * a_lin_peak * scan_dur * scan_dur;
-                    const bool suppress =
-                        (hq_angular_vel_threshold_  > 0.0 && omega_peak   > hq_angular_vel_threshold_) ||
-                        (hq_linear_accel_threshold_ > 0.0 && a_lin_peak   > hq_linear_accel_threshold_) ||
-                        (hq_slerp_max_range_        > 0.0 && slerp_score  > hq_slerp_max_range_);
-                    if (suppress)
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                             "HQ suppressed: w=%.2f rad/s  a_lin=%.2f m/s2  score=%.3f m",
-                                             omega_peak, a_lin_peak, slerp_score);
-                    return suppress;
-                }();
-
-                if (hq_pending_.size() < kMaxHqPending) {
-                    hq_pending_.push_back({Measures.lidar, Measures.lidar_beg_time,
-                                           lidar_end_time, lidar_frame, suppress_hq,
-                                           scan_id});
-                }
-                // Bundle mode: also queue L2 separately
-                if (multi_lidar && update_mode == 0 && Measures.lidar2 && !Measures.lidar2->empty()) {
-                    if (hq_pending_.size() < kMaxHqPending) {
-                        hq_pending_.push_back({Measures.lidar2, Measures.lidar_beg_time2,
-                                               lidar_end_time2, lidar_frame, suppress_hq, 2});
-                    }
-                }
-
-                // Process all scans whose time window is now bracketed by SLAM poses
-                while (!hq_pending_.empty()) {
-                    auto& front = hq_pending_.front();
-                    if (!hq_pose_undistorter_.hasCoverage(front.t_beg, front.t_end)) {
-                        // We have a pose after t_end but none before t_beg (startup case:
-                        // no pose exists from before the very first scan). Discard and move on.
-                        if (hq_pose_undistorter_.newestStamp() > front.t_end) {
-                            hq_pending_.pop_front();
-                            continue;
-                        }
-                        break;
-                    }
-                    if (!front.suppress && front.cloud) {
-                        PointCloudXYZI hq_cloud = *front.cloud;
-                        sort(hq_cloud.points.begin(), hq_cloud.points.end(), time_list);
-                        if (hq_pose_undistorter_.undistort(hq_cloud, front.t_beg, front.t_end,
-                                                            R_LI, t_LI)) {
-                            sensor_msgs::msg::PointCloud2 hq_msg;
-                            pcl::toROSMsg(hq_cloud, hq_msg);
-                            hq_msg.header.frame_id = front.frame_id;
-                            hq_msg.header.stamp = get_ros_time(front.t_end);
-                            if (front.lidar_id == 1 && pubLaserCloud_L1_hq_)
-                                pubLaserCloud_L1_hq_->publish(hq_msg);
-                            else if (front.lidar_id == 2 && pubLaserCloud_L2_hq_)
-                                pubLaserCloud_L2_hq_->publish(hq_msg);
-                        }
-                    }
-                    hq_pending_.pop_front();
-                }
-
-                // Keep pose buffer bounded
-                if (!hq_pending_.empty())
-                    hq_pose_undistorter_.pruneBefore(hq_pending_.front().t_beg - 2.0);
+            if (!multi_lidar && !passive_secondary && scan_pub_en) {
+                // Single-lidar: publish decimated cloud on undistorted_downsampled
+                publish_frame_lidar_for(pubUndistortedDownsampled_, feats_undistort, lidar_frame);
             }
+
+            // Async full-res cloud publish (at-most-one in-flight task: future destructor blocks).
+            // Stamp captured on the main thread so the async lambda uses the actual scan end time,
+            // not get_clock()->now() which may race ahead by the time the lambda runs.
+            const rclcpp::Time scan_stamp = get_ros_time(lidar_end_time);
+            if (multi_lidar || passive_secondary) {
+                if (current_full_cloud_L1 && !current_full_cloud_L1->empty()) {
+                    auto traj  = p_imu->captureTrajectory();
+                    auto cloud = current_full_cloud_L1;
+                    auto pub   = pubUndistortedL1_;
+                    auto frame = lidar_frame;
+                    auto stamp = scan_stamp;
+                    full_cloud_future_L1_ = std::async(std::launch::async, [traj, cloud, pub, frame, stamp]() {
+                        traj.applyTo(*cloud);
+                        sensor_msgs::msg::PointCloud2 ros_msg;
+                        pcl::toROSMsg(*cloud, ros_msg);
+                        ros_msg.header.stamp = stamp;
+                        ros_msg.header.frame_id = frame;
+                        pub->publish(ros_msg);
+                    });
+                }
+                if (current_full_cloud_L2 && !current_full_cloud_L2->empty()) {
+                    auto traj   = p_imu->captureTrajectory();
+                    auto cloud  = current_full_cloud_L2;
+                    auto pub    = pubUndistortedL2_;
+                    auto frame2 = lidar_frame2;
+                    M3D R_L2_inv = Lidar2_R_wrt_L1.transpose();
+                    V3D T_L2     = Lidar2_T_wrt_L1;
+                    auto stamp   = scan_stamp;
+                    full_cloud_future_L2_ = std::async(std::launch::async, [traj, cloud, pub, frame2, R_L2_inv, T_L2, stamp]() {
+                        traj.applyTo(*cloud);
+                        // Back-transform from L1 frame to L2 frame
+                        for (auto& pt : cloud->points) {
+                            V3D p_L2 = R_L2_inv * (V3D(pt.x, pt.y, pt.z) - T_L2);
+                            pt.x = p_L2(0); pt.y = p_L2(1); pt.z = p_L2(2);
+                        }
+                        sensor_msgs::msg::PointCloud2 ros_msg;
+                        pcl::toROSMsg(*cloud, ros_msg);
+                        ros_msg.header.stamp = stamp;
+                        ros_msg.header.frame_id = frame2;
+                        pub->publish(ros_msg);
+                    });
+                }
+            } else {
+                if (current_full_cloud_L1 && !current_full_cloud_L1->empty()) {
+                    auto traj  = p_imu->captureTrajectory();
+                    auto cloud = current_full_cloud_L1;
+                    auto pub   = pubUndistorted_;
+                    auto frame = lidar_frame;
+                    auto stamp = scan_stamp;
+                    full_cloud_future_ = std::async(std::launch::async, [traj, cloud, pub, frame, stamp]() {
+                        traj.applyTo(*cloud);
+                        sensor_msgs::msg::PointCloud2 ros_msg;
+                        pcl::toROSMsg(*cloud, ros_msg);
+                        ros_msg.header.stamp = stamp;
+                        ros_msg.header.frame_id = frame;
+                        pub->publish(ros_msg);
+                    });
+                }
+            }
+
+            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
 
             /*** Terminal status display (throttled to 5Hz) ***/
             auto now = std::chrono::steady_clock::now();
@@ -2099,6 +2222,15 @@ private:
         imu_buffer.clear();
         time_buffer2.clear();
         lidar_buffer2.clear();
+        full_lidar_buffer.clear();
+        full_lidar_buffer2.clear();
+        current_full_cloud_L1.reset();
+        current_full_cloud_L2.reset();
+        // Wait for any in-flight async full-res publish tasks to finish before reset.
+        if (full_cloud_future_.valid()) full_cloud_future_.get();
+        if (full_cloud_future_L1_.valid()) full_cloud_future_L1_.get();
+        if (full_cloud_future_L2_.valid()) full_cloud_future_L2_.get();
+        p_imu->clearAnchor();
 
         // === Reset Point Clouds ===
         featsFromMap->clear();
@@ -2169,11 +2301,8 @@ private:
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id = sensor_init_frame;
 
-        // === Reset IMU Processor and HQ state ===
+        // === Reset IMU Processor ===
         p_imu->Reset();
-        p_imu->clearAnchor();
-        hq_pose_undistorter_.clear();
-        hq_pending_.clear();
 
         mtx_buffer.unlock();
 
@@ -2192,7 +2321,7 @@ private:
 
     void tf_resolve_callback()
     {
-        if (!multi_lidar || !l2_extrinsic_from_tf || l2_extrinsic_resolved) {
+        if ((!multi_lidar && !passive_secondary) || !l2_extrinsic_from_tf || l2_extrinsic_resolved) {
             tf_init_timer_->cancel();
             return;
         }
@@ -2220,19 +2349,23 @@ private:
     }
 
 private:
+    // Publishers declared before futures so futures are destroyed first (reverse init order).
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L1_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L2_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubUndistortedL1_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubUndistortedL2_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubUndistorted_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubUndistortedDownsampled_;
+    rclcpp::Publisher<fast_lio::msg::MotionDiagnostics>::SharedPtr pubMotionDiag_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
-    // SLERP HQ publishers (optional, only created when publish_hq_cloud is true)
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L1_hq_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud_L2_hq_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc2_;
@@ -2251,8 +2384,19 @@ private:
     rclcpp::CallbackGroup::SharedPtr lidar1_cbg_;
     rclcpp::CallbackGroup::SharedPtr lidar2_cbg_;
     rclcpp::CallbackGroup::SharedPtr imu_cbg_;
+    rclcpp::CallbackGroup::SharedPtr odom_cbg_;
     rclcpp::TimerBase::SharedPtr tf_init_timer_;
+    // Futures declared AFTER publishers so they are destroyed FIRST, ensuring async tasks
+    // can safely dereference publisher SharedPtrs during destruction.
     std::future<void> map_pub_future_;
+    std::future<void> full_cloud_future_;
+    std::future<void> full_cloud_future_L1_;
+    std::future<void> full_cloud_future_L2_;
+
+    bool use_odom_anchor_{false};
+    double odom_anchor_timeout_{0.5};
+    std::string odom_topic_;
+    double slerp_max_range_{10.0};
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
@@ -2265,14 +2409,6 @@ private:
     double epsi[23] = {0.001};
     double map_voxel_filter_size = 0.25, map_pub_interval = 2.0;
 
-    // SLERP HQ secondary output state
-    bool publish_hq_cloud_ = false;
-    double hq_angular_vel_threshold_ = 0.5;
-    double hq_linear_accel_threshold_ = 5.0;
-    double hq_slerp_max_range_ = 0.6;
-    PoseUndistorter hq_pose_undistorter_;
-    std::deque<HqPending> hq_pending_;
-
     void print_status(double frame_time)
     {
         V3D cur_pos(state_point.pos(0), state_point.pos(1), state_point.pos(2));
@@ -2281,7 +2417,8 @@ private:
         // Clear terminal and print status
         //printf("\033[2J\033[1;1H");
         std::cout << std::endl;
-        std::string mode_str = multi_lidar ? (update_mode == 1 ? " ASYNC" : " BUNDLE") : "";
+        std::string mode_str = multi_lidar ? (update_mode == 1 ? " ASYNC" : " BUNDLE")
+                                           : (passive_secondary ? " PASSIVE-SECONDARY" : "");
         std::cout << "==== FAST-LIO" << mode_str << " ====" << std::endl;
         std::cout << std::endl << std::setprecision(4) << std::fixed;
         std::cout << "Position    [xyz]  :: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << std::endl;
@@ -2293,10 +2430,10 @@ private:
         std::cout << "--- Messages Received ---" << std::endl;
         std::cout << "  IMU    [" << imu_topic << "] :: " << imu_msg_count << std::endl;
         std::cout << "  LiDAR1 [" << lid_topic << "] :: " << lidar_msg_count << std::endl;
-        if (multi_lidar)
+        if (multi_lidar || passive_secondary)
         {
             std::cout << "  LiDAR2 [" << lid_topic2 << "] :: " << lidar2_msg_count << std::endl;
-            if (update_mode == 1)
+            if (multi_lidar && update_mode == 1)
                 std::cout << "  Last Async   :: L" << last_async_lidar
                           << "  (buf: L1=" << lidar_buffer.size() << " L2=" << lidar_buffer2.size() << ")" << std::endl;
         }
