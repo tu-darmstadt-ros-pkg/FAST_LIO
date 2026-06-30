@@ -676,6 +676,10 @@ void Preprocess::xyzrtlo_handler(const sensor_msgs::msg::PointCloud2::ConstShare
 
   for (uint i = 0; i < plsize; i++)
   {
+    // check for nan
+    if (std::isnan(pl_orig.points[i].x) || std::isnan(pl_orig.points[i].y) || std::isnan(pl_orig.points[i].z))
+      continue;
+
     if ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00)
     {
       valid_num++;
