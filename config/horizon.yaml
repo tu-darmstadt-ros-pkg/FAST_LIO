@@ -29,6 +29,7 @@
             fov_degree:    100.0
             det_range:     260.0
             extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
+            min_eff_points: 20           # minimum number of effective (matched) points required for an EKF update
             extrinsic_T: [ 0.05512, 0.02226, -0.0297 ]
             extrinsic_R: [ 1., 0., 0.,
                         0., 1., 0.,

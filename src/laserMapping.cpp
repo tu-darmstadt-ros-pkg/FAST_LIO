@@ -105,6 +105,7 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+int    min_eff_points = 20;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -1123,7 +1124,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
-    if (effct_feat_num < 20)
+    if (effct_feat_num < min_eff_points)
     {
         ekfom_data.valid = false;
         std::cerr << "No Effective Points!" << std::endl;
@@ -1221,6 +1222,7 @@ public:
         this->declare_parameter<std::string>("odom_topic", std::string("Odometry"));
         this->declare_parameter<double>("slerp_max_range", 10.0);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<int>("mapping.min_eff_points", 20);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
@@ -1254,6 +1256,7 @@ public:
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+        this->get_parameter_or<int>("mapping.min_eff_points", min_eff_points, 20);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
@@ -1940,13 +1943,6 @@ private:
                 }
             }
 
-            {
-                double t_elapsed = Measures.lidar_beg_time - first_lidar_time;
-                if (t_elapsed < 60.0)
-                    printf("[STARTUP t=%5.2fs] feats_down=%-5d  effct=%-5d  L=%d\n",
-                           t_elapsed, feats_down_size, effct_feat_num, last_async_lidar);
-            }
-
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
@@ -2405,7 +2401,7 @@ private:
 
     // Throttling for print_status (5Hz = 200ms min interval)
     std::chrono::steady_clock::time_point last_print_status_time = std::chrono::steady_clock::now();
-    const std::chrono::milliseconds print_status_throttle_interval{200}; // 5Hz throttle
+    const std::chrono::milliseconds print_status_throttle_interval{1000}; // 5Hz throttle
     double epsi[23] = {0.001};
     double map_voxel_filter_size = 0.25, map_pub_interval = 2.0;
 
@@ -2413,39 +2409,32 @@ private:
     {
         V3D cur_pos(state_point.pos(0), state_point.pos(1), state_point.pos(2));
         double dist_to_origin = cur_pos.norm();
+        V3D euler = SO3ToEuler(state_point.rot);
 
-        // Clear terminal and print status
-        //printf("\033[2J\033[1;1H");
-        std::cout << std::endl;
         std::string mode_str = multi_lidar ? (update_mode == 1 ? " ASYNC" : " BUNDLE")
                                            : (passive_secondary ? " PASSIVE-SECONDARY" : "");
-        std::cout << "==== FAST-LIO" << mode_str << " ====" << std::endl;
-        std::cout << std::endl << std::setprecision(4) << std::fixed;
-        std::cout << "Position    [xyz]  :: " << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << std::endl;
-        V3D euler = SO3ToEuler(state_point.rot);
-        std::cout << "Orientation [rpy]  :: " << euler(0) << " " << euler(1) << " " << euler(2) << std::endl;
-        std::cout << "Distance to Origin :: " << dist_to_origin << " m" << std::endl;
-        std::cout << std::endl;
-        std::cout << std::right << std::setprecision(2) << std::fixed;
-        std::cout << "--- Messages Received ---" << std::endl;
-        std::cout << "  IMU    [" << imu_topic << "] :: " << imu_msg_count << std::endl;
-        std::cout << "  LiDAR1 [" << lid_topic << "] :: " << lidar_msg_count << std::endl;
+        std::cout << std::endl << "==== FAST-LIO" << mode_str << " ====" << std::endl;
+
+        std::cout << std::setprecision(4) << std::fixed;
+        std::cout << "Pos [" << cur_pos(0) << " " << cur_pos(1) << " " << cur_pos(2)
+                   << "]  Rot [" << euler(0) << " " << euler(1) << " " << euler(2)
+                   << "]  Dist " << dist_to_origin << " m" << std::endl;
+
+        std::cout << "Msgs  IMU:" << imu_msg_count << "  LiDAR1:" << lidar_msg_count;
         if (multi_lidar || passive_secondary)
         {
-            std::cout << "  LiDAR2 [" << lid_topic2 << "] :: " << lidar2_msg_count << std::endl;
+            std::cout << "  LiDAR2:" << lidar2_msg_count;
             if (multi_lidar && update_mode == 1)
-                std::cout << "  Last Async   :: L" << last_async_lidar
-                          << "  (buf: L1=" << lidar_buffer.size() << " L2=" << lidar_buffer2.size() << ")" << std::endl;
+                std::cout << "  (async L" << last_async_lidar << ", buf L1=" << lidar_buffer.size()
+                          << " L2=" << lidar_buffer2.size() << ")";
         }
         std::cout << std::endl;
-        std::cout << "--- Performance ---" << std::endl;
-        std::cout << "  Frame Time    :: " << std::setfill(' ') << std::setw(7) << frame_time * 1000.0 << " ms" << std::endl;
-        std::cout << "  Avg Total     :: " << std::setfill(' ') << std::setw(7) << aver_time_consu * 1000.0 << " ms" << std::endl;
-        std::cout << "  Points (raw)  :: " << std::setfill(' ') << std::setw(7) << (feats_undistort ? (int)feats_undistort->points.size() : 0) << std::endl;
-        std::cout << "  Points (down) :: " << std::setfill(' ') << std::setw(7) << feats_down_size << std::endl;
-        std::cout << "  Eff. Features :: " << std::setfill(' ') << std::setw(7) << effct_feat_num << std::endl;
-        std::cout << "  Map Size      :: " << std::setfill(' ') << std::setw(7) << ikdtree.size() << std::endl;
-        //std::cout << std::flush;
+
+        std::cout << std::setprecision(2) << std::fixed;
+        std::cout << "Perf  Frame:" << frame_time * 1000.0 << "ms  Avg:" << aver_time_consu * 1000.0
+                   << "ms  Pts:" << (feats_undistort ? (int)feats_undistort->points.size() : 0)
+                   << "/" << feats_down_size << "  Eff:" << effct_feat_num
+                   << "  Map:" << ikdtree.size() << "  L:" << last_async_lidar << std::endl;
     }
 
     FILE *fp;
