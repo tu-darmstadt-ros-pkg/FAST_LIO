@@ -1812,7 +1812,8 @@ public:
 			}
 
 			//K_x = K_ * h_x_;
-			Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; 
+			Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
+			dx_ = check_safe_update(dx_);
 			state x_before = x_;
 			x_.boxplus(dx_);
 			dyn_share.converge = true;
@@ -1987,15 +1988,20 @@ private:
         T temp_vec = _temp_vec;
         if ( std::isnan( temp_vec(0, 0) ) )
         {
+            printf("\033[1;31m\n!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n  EKF UPDATE BLOCKED: NaN in state delta — zeroing update\n!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n\033[0m\n");
             temp_vec.setZero();
             return temp_vec;
         }
         double angular_dis = temp_vec.block( 0, 0, 3, 1 ).norm() * 57.3;
         double pos_dis = temp_vec.block( 3, 0, 3, 1 ).norm();
-        if ( angular_dis >= 20 || pos_dis > 1 )
+        if ( angular_dis >= 20 || pos_dis > 0.5 )
         {
-            printf( "Angular dis = %.2f, pos dis = %.2f\r\n", angular_dis, pos_dis );
-            temp_vec.setZero();
+            double scale = 1.0;
+            if ( angular_dis >= 20 ) scale = std::min( scale, 19.9 / angular_dis );
+            if ( pos_dis > 0.5 )     scale = std::min( scale, 0.49 / pos_dis );
+            printf("\033[1;31m\n!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n  EKF UPDATE SCALED: angle=%.2f->%.2f deg  pos=%.3f->%.3f m\n!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=!=\n\033[0m\n",
+                angular_dis, angular_dis * scale, pos_dis, pos_dis * scale);
+            temp_vec *= scale;
         }
         return temp_vec;
     }

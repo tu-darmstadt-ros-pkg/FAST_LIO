@@ -17,7 +17,7 @@
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
             
         preprocess:
-            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+            lidar_type: 1                # 1 LIVOX_CUSTOM, 2 VELODYNE, 3 OUSTER, 4 XYZRTL, 5 XYZRTLO_AVIA, 6 XYZRTLO
             scan_line:  6
             blind: 4.0
 
@@ -29,6 +29,7 @@
             fov_degree:    100.0
             det_range:     260.0
             extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
+            min_eff_points: 20           # minimum number of effective (matched) points required for an EKF update
             extrinsic_T: [ 0.05512, 0.02226, -0.0297 ]
             extrinsic_R: [ 1., 0., 0.,
                         0., 1., 0.,
