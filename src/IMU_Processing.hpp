@@ -16,10 +16,12 @@
 #include <pcl/common/transforms.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <memory>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "use-ikfom.hpp"
+#include "l2_imu_undistort.hpp"
 
 /// *************Preconfiguration
 
@@ -71,6 +73,19 @@ class ImuProcess
 
   // Value-copy of the IMU trajectory from the last Process() call — safe to use from any thread.
   TrajectorySnapshot captureTrajectory() const { return {IMUpose, last_undistort_state_}; }
+
+  // Secondary-IMU undistortion: L2 scans are undistorted in their own frame with
+  // their own IMU's gyro. Active once enableSecondaryImu() has been called.
+  void enableSecondaryImu(const L2ImuExtrinsics &ext)
+  {
+    if (!l2_undistort_) l2_undistort_ = std::make_unique<L2ImuUndistort>();
+    l2_undistort_->setExtrinsics(ext);
+  }
+  bool secondaryImuEnabled() const { return l2_undistort_ != nullptr; }
+  // True when the last Process() undistorted L2 with its own IMU (the per-lidar L2
+  // output is then in the native L2 frame).
+  bool hasL2Snapshot() const { return l2_snapshot_valid_; }
+  L2TrajectorySnapshot captureL2Trajectory() const { return l2_snapshot_; }
   ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;
@@ -82,7 +97,8 @@ class ImuProcess
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
-  void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+  void RewindImuPose(const deque<sensor_msgs::msg::Imu::ConstSharedPtr> &v_imu, const state_ikfom &state, double pcl_beg_time);
+  void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out, const PointCloudXYZI::Ptr &pcl_native_l2_out = nullptr);
   void UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out, PointCloudXYZI::Ptr pcl_L1_out, PointCloudXYZI::Ptr pcl_L2_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
@@ -100,11 +116,20 @@ class ImuProcess
   double start_timestamp_;
   double last_lidar_end_time_;
   double last_lidar_end_time_L2_ = 0.0;
+  // Absolute time the filter state was last predicted to. Unlike the per-lidar
+  // last_lidar_end_time_ cursors, this is global across both lidars.
+  double state_time_ = 0.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
 
   state_ikfom last_undistort_state_{};
+
+  // Secondary-IMU undistortion (null when disabled).
+  std::unique_ptr<L2ImuUndistort> l2_undistort_;
+  L2TrajectorySnapshot l2_snapshot_;
+  bool l2_snapshot_valid_ = false;
+  int l2_fallback_count_ = 0;
 
   // Anchor pose from external SLAM odometry (protected by anchor_mutex_).
   mutable std::mutex anchor_mutex_;
@@ -153,10 +178,13 @@ void ImuProcess::Reset()
   init_iter_num        = 1;
   last_lidar_end_time_    = 0.0;
   last_lidar_end_time_L2_ = 0.0;
+  state_time_             = 0.0;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  l2_snapshot_valid_ = false;
+  if (l2_undistort_) l2_undistort_->resetInit();
 }
 
 void ImuProcess::setAnchorPose(const V3D& pos, const M3D& rot, const V3D& vel, double stamp) {
@@ -323,7 +351,55 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
 }
 
-void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out)
+/*** Reconstruct IMU poses covering [pcl_beg_time, state_time_] by integrating the
+ * measurements backward from the current filter state. In multi-lidar operation the
+ * scan windows of the two lidars overlap, so the filter has already been propagated
+ * past this scan's begin time — the undistortion trajectory must still cover the
+ * full scan window. Appends knots to IMUpose in ascending time order, ending with
+ * one at state_time_. Never touches the filter state or covariance. ***/
+void ImuProcess::RewindImuPose(const deque<sensor_msgs::msg::Imu::ConstSharedPtr> &v_imu, const state_ikfom &state, double pcl_beg_time)
+{
+  int last_below = -1;
+  for (size_t i = 0; i < v_imu.size(); i++)
+  {
+    if (rclcpp::Time(v_imu[i]->header.stamp).seconds() >= state_time_) break;
+    last_below = static_cast<int>(i);
+  }
+
+  V3D grav(state.grav[0], state.grav[1], state.grav[2]);
+  double t_hi = state_time_;
+  M3D R_hi = state.rot.toRotationMatrix();
+  V3D vel_hi = state.vel;
+  V3D pos_hi = state.pos;
+  vector<Pose6D> knots;  // built newest-first, appended in reverse below
+  for (int j = last_below; j >= 0; j--)
+  {
+    const auto &lo = v_imu[j];
+    const auto &hi = v_imu[(j + 1 < static_cast<int>(v_imu.size())) ? j + 1 : j];
+    double t_lo = rclcpp::Time(lo->header.stamp).seconds();
+    double dt = t_hi - t_lo;
+    V3D angvel_avr(0.5 * (lo->angular_velocity.x + hi->angular_velocity.x),
+                   0.5 * (lo->angular_velocity.y + hi->angular_velocity.y),
+                   0.5 * (lo->angular_velocity.z + hi->angular_velocity.z));
+    V3D acc_avr(0.5 * (lo->linear_acceleration.x + hi->linear_acceleration.x),
+                0.5 * (lo->linear_acceleration.y + hi->linear_acceleration.y),
+                0.5 * (lo->linear_acceleration.z + hi->linear_acceleration.z));
+    if (!acc_avr.allFinite() || !angvel_avr.allFinite() || dt <= 0.0) continue;
+    angvel_avr -= state.bg;
+    V3D acc_w = R_hi * (acc_avr * G_m_s2 / mean_acc.norm() - state.ba) + grav;
+    // the knot at t_hi is the tail of segment [t_lo, t_hi]: it carries the segment's acc/gyr
+    knots.push_back(set_pose6d(t_hi - pcl_beg_time, acc_w, angvel_avr, vel_hi, pos_hi, R_hi));
+    M3D R_lo = R_hi * Exp(angvel_avr, -dt);
+    V3D vel_lo = vel_hi - acc_w * dt;
+    V3D pos_lo = pos_hi - vel_lo * dt - 0.5 * acc_w * dt * dt;
+    t_hi = t_lo; R_hi = R_lo; vel_hi = vel_lo; pos_hi = pos_lo;
+  }
+  // bottom knot; never used as a segment tail, so acc/gyr are placeholders
+  knots.push_back(set_pose6d(t_hi - pcl_beg_time, acc_s_last, angvel_last, vel_hi, pos_hi, R_hi));
+  IMUpose.insert(IMUpose.end(), knots.rbegin(), knots.rend());
+}
+
+void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out, const PointCloudXYZI::Ptr &pcl_native_l2_out)
 {
   // Reset EKF pos/rot/vel from SLAM anchor if available.
   {
@@ -337,33 +413,35 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     }
   }
 
-  /*** add the imu of the last frame-tail to the of current frame-head ***/
+  /*** the imu covering the scan window (sync keeps one message at or before the scan begin) ***/
   auto v_imu = meas.imu;
-  v_imu.push_front(last_imu_);
-  const double &imu_beg_time = rclcpp::Time(v_imu.front()->header.stamp).seconds();
+  if (v_imu.empty()) v_imu.push_back(last_imu_);
   const double &imu_end_time = rclcpp::Time(v_imu.back()->header.stamp).seconds();
   const double &pcl_beg_time = meas.lidar_beg_time;
   const double &pcl_end_time = meas.lidar_end_time;
 
   /*** skip gap IMU to avoid dead-reckoning over a sensor restart ***/
-  if (last_lidar_end_time_ > 0.0 && pcl_beg_time - last_lidar_end_time_ > 1.0)
+  if (state_time_ > 0.0 && pcl_beg_time - state_time_ > 1.0)
   {
     printf("\033[1;33m[IMU] Gap %.3fs > 1s: skipping gap IMU, advancing cursor to scan start\n\033[0m",
-           pcl_beg_time - last_lidar_end_time_);
+           pcl_beg_time - state_time_);
+    state_time_ = pcl_beg_time;
     last_lidar_end_time_ = pcl_beg_time;
   }
 
   /*** sort point clouds by offset time ***/
   pcl_in_out = *(meas.lidar);
   sort(pcl_in_out.points.begin(), pcl_in_out.points.end(), time_list);
-  // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
-  //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
 
-  /*** Initialize IMU pose ***/
+  /*** Initialize IMU pose: rewind to cover [scan begin, filter time] when the filter
+   * is already past this scan's begin (overlapping multi-lidar windows) ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
   IMUpose.reserve(v_imu.size() + 2);
-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+  if (state_time_ > 0.0 && pcl_beg_time < state_time_)
+    RewindImuPose(v_imu, imu_state, pcl_beg_time);
+  if (IMUpose.empty())
+    IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
 
   /*** forward propagation at each imu point ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
@@ -384,7 +462,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     double tail_stamp = rclcpp::Time(tail->header.stamp).seconds();
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
-    if (tail_stamp < last_lidar_end_time_)    continue;
+    if (tail_stamp <= state_time_)    continue;
 
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
@@ -397,10 +475,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
-    if(head_stamp < last_lidar_end_time_)
+    if(head_stamp < state_time_)
     {
-      dt = tail_stamp - last_lidar_end_time_;
-      // dt = tail->header.stamp.toSec() - pcl_beg_time;
+      dt = tail_stamp - state_time_;
     }
     else
     {
@@ -438,9 +515,40 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   imu_state = kf_state.get_x();
   if (!meas.imu.empty()) last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
+  state_time_ = std::max(state_time_, pcl_end_time);
+
+  if (pcl_in_out.points.begin() == pcl_in_out.points.end()) return;
+
+  /*** async L2 scan with its own IMU: undistort in the native L2 frame, then bring
+   * the cloud into the L1 frame for the EKF update ***/
+  if (meas.lidar_is_l2 && l2_undistort_)
+  {
+    l2_snapshot_valid_ = l2_undistort_->buildSnapshot(meas, IMUpose, pcl_beg_time, imu_state, pcl_end_time, l2_snapshot_);
+    const auto &ext = l2_undistort_->extrinsics();
+    if (l2_snapshot_valid_)
+    {
+      l2_snapshot_.applyTo(pcl_in_out);
+      if (pcl_native_l2_out) *pcl_native_l2_out = pcl_in_out;
+      for (auto &pt : pcl_in_out.points)
+      {
+        V3D p_L1 = ext.lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + ext.lidar2_T_wrt_L1;
+        pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+      }
+      last_undistort_state_ = imu_state;
+      return;
+    }
+    /*** fallback: the legacy path below expects the cloud in the L1 frame ***/
+    if (++l2_fallback_count_ % 100 == 1)
+      printf("\033[1;33m[IMU2] insufficient IMU2 data — falling back to primary-IMU undistortion for L2 (%d so far)\n\033[0m",
+             l2_fallback_count_);
+    for (auto &pt : pcl_in_out.points)
+    {
+      V3D p_L1 = ext.lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + ext.lidar2_T_wrt_L1;
+      pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+    }
+  }
 
   /*** undistort each lidar point (backward propagation) ***/
-  if (pcl_in_out.points.begin() == pcl_in_out.points.end()) return;
   auto it_pcl = pcl_in_out.points.end() - 1;
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
   {
@@ -498,19 +606,19 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     }
   }
 
-  /*** add the imu of the last frame-tail to the of current frame-head ***/
+  /*** the imu covering the combined scan window (sync keeps one message at or before its begin) ***/
   auto v_imu = meas.imu;
-  v_imu.push_front(last_imu_);
-  const double &imu_beg_time = rclcpp::Time(v_imu.front()->header.stamp).seconds();
+  if (v_imu.empty()) v_imu.push_back(last_imu_);
   const double &imu_end_time = rclcpp::Time(v_imu.back()->header.stamp).seconds();
   const double pcl_beg_time = std::min(meas.lidar_beg_time, meas.lidar_beg_time2);
   const double pcl_end_time = std::max(meas.lidar_end_time, meas.lidar_end_time2);
 
   /*** skip gap IMU to avoid dead-reckoning over a sensor restart ***/
-  if (last_lidar_end_time_ > 0.0 && pcl_beg_time - last_lidar_end_time_ > 1.0)
+  if (state_time_ > 0.0 && pcl_beg_time - state_time_ > 1.0)
   {
     printf("\033[1;33m[IMU/multi] Gap %.3fs > 1s: skipping gap IMU, advancing cursor to scan start\n\033[0m",
-           pcl_beg_time - last_lidar_end_time_);
+           pcl_beg_time - state_time_);
+    state_time_ = pcl_beg_time;
     last_lidar_end_time_ = pcl_beg_time;
   }
 
@@ -521,17 +629,25 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   double time_offset_1 = (meas.lidar_beg_time - pcl_beg_time) * 1000.0;
   for (auto& pt : pcl_L1_out->points) pt.curvature += time_offset_1;
 
+  // With the secondary IMU, L2 is undistorted in its own frame and time base; only
+  // the legacy path rebases to the combined base (fallback rebasing happens later).
+  const bool try_l2_own_imu = l2_undistort_ != nullptr;
   double time_offset_2 = (meas.lidar_beg_time2 - pcl_beg_time) * 1000.0;
-  for (auto& pt : pcl_L2_out->points) pt.curvature += time_offset_2;
+  if (!try_l2_own_imu)
+    for (auto& pt : pcl_L2_out->points) pt.curvature += time_offset_2;
 
   sort(pcl_L1_out->points.begin(), pcl_L1_out->points.end(), time_list);
   sort(pcl_L2_out->points.begin(), pcl_L2_out->points.end(), time_list);
 
-  /*** Initialize IMU pose ***/
+  /*** Initialize IMU pose: rewind to cover [combined begin, filter time] (the previous
+   * combined window's end generally lies past this one's begin) ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
   IMUpose.reserve(v_imu.size() + 2);
-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+  if (state_time_ > 0.0 && pcl_beg_time < state_time_)
+    RewindImuPose(v_imu, imu_state, pcl_beg_time);
+  if (IMUpose.empty())
+    IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
 
   /*** forward propagation at each imu point ***/
   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
@@ -550,7 +666,7 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     double tail_stamp = rclcpp::Time(tail->header.stamp).seconds();
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
-    if (tail_stamp < last_lidar_end_time_)    continue;
+    if (tail_stamp <= state_time_)    continue;
 
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
                 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
@@ -563,8 +679,8 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm();
 
-    if(head_stamp < last_lidar_end_time_)
-      dt = tail_stamp - last_lidar_end_time_;
+    if(head_stamp < state_time_)
+      dt = tail_stamp - state_time_;
     else
       dt = tail_stamp - head_stamp;
 
@@ -599,6 +715,29 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
   imu_state = kf_state.get_x();
   if (!meas.imu.empty()) last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
+  state_time_ = std::max(state_time_, pcl_end_time);
+
+  /*** L2 with its own IMU: build the gyro2 trajectory targeting the combined scan end;
+   * on failure fall back to the legacy path (L1 frame + combined time base) ***/
+  bool l2_own_imu = false;
+  if (try_l2_own_imu)
+  {
+    l2_snapshot_valid_ = l2_undistort_->buildSnapshot(meas, IMUpose, pcl_beg_time, imu_state, pcl_end_time, l2_snapshot_);
+    l2_own_imu = l2_snapshot_valid_;
+    if (!l2_own_imu)
+    {
+      if (++l2_fallback_count_ % 100 == 1)
+        printf("\033[1;33m[IMU2] insufficient IMU2 data — falling back to primary-IMU undistortion for L2 (%d so far)\n\033[0m",
+               l2_fallback_count_);
+      const auto &ext = l2_undistort_->extrinsics();
+      for (auto& pt : pcl_L2_out->points)
+      {
+        V3D p_L1 = ext.lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + ext.lidar2_T_wrt_L1;
+        pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+        pt.curvature += time_offset_2;
+      }
+    }
+  }
 
   /*** undistort L1 and L2 points in parallel (independent backward propagations) ***/
   #pragma omp parallel sections num_threads(2)
@@ -641,7 +780,11 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
 
     #pragma omp section
     {
-      if (!pcl_L2_out->points.empty())
+      if (l2_own_imu && !pcl_L2_out->points.empty())
+      {
+        l2_snapshot_.applyTo(*pcl_L2_out);
+      }
+      else if (!pcl_L2_out->points.empty())
       {
         V3D angvel_l2, acc_l2, vel_l2, pos_l2;
         M3D R_l2;
@@ -676,7 +819,34 @@ void ImuProcess::UndistortPclMultiLiDAR(const MeasureGroup &meas, esekfom::esekf
     }
   }
 
-  pcl_in_out = *pcl_L1_out + *pcl_L2_out;
+  if (l2_own_imu)
+  {
+    /*** merge an L1-framed copy for the EKF; pcl_L2_out itself stays in the native L2 frame ***/
+    const auto &ext = l2_undistort_->extrinsics();
+    pcl_in_out = *pcl_L1_out;
+    pcl_in_out.points.reserve(pcl_in_out.points.size() + pcl_L2_out->points.size());
+    for (const auto& pt : pcl_L2_out->points)
+    {
+      PointType p = pt;
+      V3D p_L1 = ext.lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + ext.lidar2_T_wrt_L1;
+      p.x = p_L1(0); p.y = p_L1(1); p.z = p_L1(2);
+      pcl_in_out.push_back(p);
+    }
+  }
+  else
+  {
+    pcl_in_out = *pcl_L1_out + *pcl_L2_out;
+    if (try_l2_own_imu)
+    {
+      /*** keep the per-lidar output in the native L2 frame (undo the fallback transform) ***/
+      const auto &ext = l2_undistort_->extrinsics();
+      for (auto& pt : pcl_L2_out->points)
+      {
+        V3D p_L2 = ext.lidar2_R_wrt_L1.transpose() * (V3D(pt.x, pt.y, pt.z) - ext.lidar2_T_wrt_L1);
+        pt.x = p_L2(0); pt.y = p_L2(1); pt.z = p_L2(2);
+      }
+    }
+  }
   last_undistort_state_ = imu_state;
 }
 
@@ -687,6 +857,10 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 
   pcl_un_->clear();
   if (multi_lidar) { pcl_L1_out->clear(); pcl_L2_out->clear(); }
+  l2_snapshot_valid_ = false;
+  // Gyro-bias init for the secondary IMU. Runs beyond the (short) filter init phase
+  // until enough samples arrived — L2 scans may not appear during filter init at all.
+  if (l2_undistort_ && !l2_undistort_->biasReady()) l2_undistort_->feedInit(meas.imu2);
 
   if (meas.imu.empty() && imu_need_init_) { return; }
   if (meas.lidar == nullptr) {
@@ -719,7 +893,7 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   }
 
   if (multi_lidar) UndistortPclMultiLiDAR(meas, kf_state, *pcl_un_, pcl_L1_out, pcl_L2_out);
-  else UndistortPcl(meas, kf_state, *pcl_un_);
+  else UndistortPcl(meas, kf_state, *pcl_un_, pcl_L2_out);
 
   t2 = omp_get_wtime();
   t3 = omp_get_wtime();

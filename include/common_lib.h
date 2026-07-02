@@ -63,6 +63,8 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     double lidar_end_time, lidar_end_time2;
     PointCloudXYZI::Ptr lidar, lidar2;
     deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu;
+    deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu2;  // secondary lidar's own IMU (empty if unavailable)
+    bool lidar_is_l2 = false;  // async mode: this measure holds an L2 scan (in the L2 frame when imu2 is used)
 };
 
 struct StatesGroup

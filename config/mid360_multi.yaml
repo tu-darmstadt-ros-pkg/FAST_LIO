@@ -17,6 +17,8 @@
             lid_topic:  "/ec_swift/front_lidar/points_raw_livox"
             lid_topic2: "/back"
             imu_topic:  "/ec_swift/front_lidar/imu"
+            imu_topic2: "/ec_swift/back_lidar/imu"  # L2's own IMU; empty/unset: L2 is undistorted with the primary IMU (legacy)
+            time_offset_lidar_to_imu2: 0.0
             map_frame:  "map"
             base_frame: "base_link"
             sensor_init_frame: "sensor_init"
@@ -50,6 +52,13 @@
             extrinsic_R: [ 1.0, 0.0, 0.0,
                            0.0, 1.0, 0.0,
                            0.0, 0.0, 1.0 ]
+
+            ## L2-to-its-own-IMU extrinsic (used with imu_topic2).
+            ## Defaults to extrinsic_T/extrinsic_R when omitted (identical sensor hardware).
+            extrinsic_T_L2_wrt_I2: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R_L2_wrt_I2: [ 1.0, 0.0, 0.0,
+                                     0.0, 1.0, 0.0,
+                                     0.0, 0.0, 1.0 ]
 
             ## Choose extrinsic format for L2:
             ## extrinsic_imu_to_lidars: true  => use (extrinsic_T2, extrinsic_R2) as IMU-to-L2

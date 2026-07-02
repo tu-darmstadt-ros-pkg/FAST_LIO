@@ -194,6 +194,25 @@ V3D Lidar2_T_wrt_L1(Zero3d);
 M3D Lidar2_R_wrt_L1(Eye3d);
 shared_ptr<Preprocess> p_pre2(new Preprocess());
 
+/*** Secondary IMU (L2's own IMU, used to undistort L2 in its native frame) ***/
+string imu_topic2;
+bool   use_imu2 = false;
+double time_diff_lidar_to_imu2 = 0.0;
+double last_timestamp_imu2 = -1.0;
+deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer2;
+vector<double> extrinT_L2_wrt_I2(3, 0.0);
+vector<double> extrinR_L2_wrt_I2(9, 0.0);
+
+void enable_secondary_imu()
+{
+    L2ImuExtrinsics ext;
+    ext.R_I2_L2 << MAT_FROM_ARRAY(extrinR_L2_wrt_I2);
+    ext.t_I2_L2 << VEC_FROM_ARRAY(extrinT_L2_wrt_I2);
+    ext.lidar2_R_wrt_L1 = Lidar2_R_wrt_L1;
+    ext.lidar2_T_wrt_L1 = Lidar2_T_wrt_L1;
+    p_imu->enableSecondaryImu(ext);
+}
+
 // Full-resolution preprocessors (point_filter_num=1) for the async undistorted output.
 shared_ptr<Preprocess> p_pre_full(new Preprocess());
 shared_ptr<Preprocess> p_pre_full2(new Preprocess());
@@ -378,8 +397,50 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
     sig_buffer.notify_all();
 }
 
+void imu_cbk2(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+{
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu2);
+    double timestamp = get_time_sec(msg->header.stamp);
+
+    mtx_buffer.lock();
+
+    if (timestamp < last_timestamp_imu2)
+    {
+        std::cerr << "imu2 loop back, clear buffer" << std::endl;
+        imu_buffer2.clear();
+    }
+
+    last_timestamp_imu2 = timestamp;
+
+    imu_buffer2.push_back(msg);
+    // Bound memory: nothing else prunes this buffer when L2 scans stop arriving.
+    while (!imu_buffer2.empty() && get_time_sec(imu_buffer2.front()->header.stamp) < timestamp - 10.0)
+        imu_buffer2.pop_front();
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
+/*** Non-destructively slice IMU messages covering [window_beg, window_end]:
+ * prunes the buffer front to keep exactly one message at or before window_beg
+ * (the undistortion trajectory must start at or before the scan begin) and
+ * copies all messages up to window_end into out. Messages stay in the buffer
+ * so an overlapping window of the other lidar can still use them. ***/
+void slice_imu_buffer(deque<sensor_msgs::msg::Imu::ConstSharedPtr> &buffer, double window_beg, double window_end,
+                      deque<sensor_msgs::msg::Imu::ConstSharedPtr> &out)
+{
+    while (buffer.size() > 1 && get_time_sec(buffer[1]->header.stamp) <= window_beg)
+        buffer.pop_front();
+    out.clear();
+    for (const auto &msg : buffer)
+    {
+        if (get_time_sec(msg->header.stamp) > window_end) break;
+        out.push_back(msg);
+    }
+}
+
 bool sync_packages(MeasureGroup &meas)
 {
     std::unique_lock<std::mutex> lock(mtx_buffer);
@@ -418,16 +479,9 @@ bool sync_packages(MeasureGroup &meas)
         return false;
     }
 
-    /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-    {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        if(imu_time > lidar_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
-        imu_buffer.pop_front();
-    }
+    slice_imu_buffer(imu_buffer, meas.lidar_beg_time, lidar_end_time, meas.imu);
+    meas.imu2.clear();
+    meas.lidar_is_l2 = false;
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
@@ -495,15 +549,19 @@ bool sync_packages_multi(MeasureGroup &meas)
         }
         meas.lidar_end_time2 = lidar_end_time2;
 
-        /*** Transform L2 points to L1 frame using L2-wrt-L1 extrinsic ***/
-        for (size_t i = 0; i < meas.lidar2->points.size(); i++)
+        /*** Transform L2 points to L1 frame using L2-wrt-L1 extrinsic
+         * (with the secondary IMU, L2 stays in its own frame and is transformed after undistortion) ***/
+        if (!use_imu2)
         {
-            auto &pt = meas.lidar2->points[i];
-            V3D p_L2(pt.x, pt.y, pt.z);
-            V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
-            pt.x = p_L1(0);
-            pt.y = p_L1(1);
-            pt.z = p_L1(2);
+            for (size_t i = 0; i < meas.lidar2->points.size(); i++)
+            {
+                auto &pt = meas.lidar2->points[i];
+                V3D p_L2(pt.x, pt.y, pt.z);
+                V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
+                pt.x = p_L1(0);
+                pt.y = p_L1(1);
+                pt.z = p_L1(2);
+            }
         }
 
         lidar_pushed2 = true;
@@ -516,16 +574,18 @@ bool sync_packages_multi(MeasureGroup &meas)
         return false;
     }
 
-    /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < combined_end_time))
+    meas.lidar_is_l2 = false;
+    if (use_imu2)
     {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        if(imu_time > combined_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
-        imu_buffer.pop_front();
+        /*** wait for IMU2 coverage; escape via the IMU1 clock if the IMU2 stream died ***/
+        if (last_timestamp_imu2 < combined_end_time && last_timestamp_imu < combined_end_time + 0.5)
+            return false;
+        slice_imu_buffer(imu_buffer2, meas.lidar_beg_time2, combined_end_time, meas.imu2);
     }
+    else
+        meas.imu2.clear();
+
+    slice_imu_buffer(imu_buffer, min(meas.lidar_beg_time, meas.lidar_beg_time2), combined_end_time, meas.imu);
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
@@ -534,13 +594,18 @@ bool sync_packages_multi(MeasureGroup &meas)
     current_full_cloud_L1 = full_lidar_buffer.empty() ? nullptr : full_lidar_buffer.front();
     if (!full_lidar_buffer.empty()) full_lidar_buffer.pop_front();
     if (!full_lidar_buffer2.empty()) {
-        current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
-        full_lidar_buffer2.pop_front();
-        // Transform L2 full-res cloud to L1 frame (matches what sync_packages_multi does to meas.lidar2)
-        for (auto& pt : current_full_cloud_L2->points) {
-            V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
-            pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+        if (use_imu2) {
+            // L2 full-res cloud stays in its native frame for the secondary-IMU undistortion
+            current_full_cloud_L2 = full_lidar_buffer2.front();
+        } else {
+            current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
+            // Transform L2 full-res cloud to L1 frame (matches what sync_packages_multi does to meas.lidar2)
+            for (auto& pt : current_full_cloud_L2->points) {
+                V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
+                pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+            }
         }
+        full_lidar_buffer2.pop_front();
     } else {
         current_full_cloud_L2 = nullptr;
     }
@@ -602,16 +667,9 @@ bool sync_packages_async(MeasureGroup &meas)
 
         if (last_timestamp_imu < lidar_end_time) return false;
 
-        /*** push imu data ***/
-        double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        meas.imu.clear();
-        while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-        {
-            imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-            if (imu_time > lidar_end_time) break;
-            meas.imu.push_back(imu_buffer.front());
-            imu_buffer.pop_front();
-        }
+        slice_imu_buffer(imu_buffer, meas.lidar_beg_time, lidar_end_time, meas.imu);
+        meas.imu2.clear();
+        meas.lidar_is_l2 = false;
 
         lidar_buffer.pop_front();
         time_buffer.pop_front();
@@ -626,23 +684,31 @@ bool sync_packages_async(MeasureGroup &meas)
     {
         if (lidar_buffer2.empty()) return false;
 
-        /*** push lidar 2 scan: transform to L1 frame, treat as primary ***/
+        /*** push lidar 2 scan: transform to L1 frame, treat as primary
+         * (with the secondary IMU, L2 stays in its own frame and is transformed after undistortion) ***/
         if (!lidar_pushed2)
         {
             meas.lidar_beg_time = time_buffer2.front();
 
-            // Copy and transform L2 cloud to L1 frame
-            PointCloudXYZI::Ptr cloud2(new PointCloudXYZI(*lidar_buffer2.front()));
-            for (size_t i = 0; i < cloud2->points.size(); i++)
+            if (use_imu2)
             {
-                auto &pt = cloud2->points[i];
-                V3D p_L2(pt.x, pt.y, pt.z);
-                V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
-                pt.x = p_L1(0);
-                pt.y = p_L1(1);
-                pt.z = p_L1(2);
+                meas.lidar = lidar_buffer2.front();
             }
-            meas.lidar = cloud2;
+            else
+            {
+                // Copy and transform L2 cloud to L1 frame
+                PointCloudXYZI::Ptr cloud2(new PointCloudXYZI(*lidar_buffer2.front()));
+                for (size_t i = 0; i < cloud2->points.size(); i++)
+                {
+                    auto &pt = cloud2->points[i];
+                    V3D p_L2(pt.x, pt.y, pt.z);
+                    V3D p_L1 = Lidar2_R_wrt_L1 * p_L2 + Lidar2_T_wrt_L1;
+                    pt.x = p_L1(0);
+                    pt.y = p_L1(1);
+                    pt.z = p_L1(2);
+                }
+                meas.lidar = cloud2;
+            }
 
             if (meas.lidar->points.size() <= 1)
             {
@@ -665,28 +731,35 @@ bool sync_packages_async(MeasureGroup &meas)
 
         if (last_timestamp_imu < lidar_end_time) return false;
 
-        /*** push imu data ***/
-        double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        meas.imu.clear();
-        while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+        meas.lidar_is_l2 = true;
+        if (use_imu2)
         {
-            imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-            if (imu_time > lidar_end_time) break;
-            meas.imu.push_back(imu_buffer.front());
-            imu_buffer.pop_front();
+            /*** wait for IMU2 coverage; escape via the IMU1 clock if the IMU2 stream died ***/
+            if (last_timestamp_imu2 < lidar_end_time && last_timestamp_imu < lidar_end_time + 0.5)
+                return false;
+            slice_imu_buffer(imu_buffer2, meas.lidar_beg_time, lidar_end_time, meas.imu2);
         }
+        else
+            meas.imu2.clear();
+
+        slice_imu_buffer(imu_buffer, meas.lidar_beg_time, lidar_end_time, meas.imu);
 
         lidar_buffer2.pop_front();
         time_buffer2.pop_front();
         current_full_cloud_L1 = nullptr;
         if (!full_lidar_buffer2.empty()) {
-            current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
-            full_lidar_buffer2.pop_front();
-            // Transform L2 full-res cloud to L1 frame
-            for (auto& pt : current_full_cloud_L2->points) {
-                V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
-                pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+            if (use_imu2) {
+                // L2 full-res cloud stays in its native frame for the secondary-IMU undistortion
+                current_full_cloud_L2 = full_lidar_buffer2.front();
+            } else {
+                current_full_cloud_L2 = std::make_shared<PointCloudXYZI>(*full_lidar_buffer2.front());
+                // Transform L2 full-res cloud to L1 frame
+                for (auto& pt : current_full_cloud_L2->points) {
+                    V3D p_L1 = Lidar2_R_wrt_L1 * V3D(pt.x, pt.y, pt.z) + Lidar2_T_wrt_L1;
+                    pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+                }
             }
+            full_lidar_buffer2.pop_front();
         } else {
             current_full_cloud_L2 = nullptr;
         }
@@ -1245,6 +1318,10 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R2", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_T_L2_wrt_L1", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R_L2_wrt_L1", vector<double>());
+        this->declare_parameter<string>("common.imu_topic2", "");
+        this->declare_parameter<double>("common.time_offset_lidar_to_imu2", 0.0);
+        this->declare_parameter<vector<double>>("mapping.extrinsic_T_L2_wrt_I2", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.extrinsic_R_L2_wrt_I2", vector<double>());
 
         this->get_parameter_or<int>("publish.rate", pub_rate, 10);
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
@@ -1323,6 +1400,13 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R2", extrinR2, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T_L2_wrt_L1", extrinT_L2_wrt_L1, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R_L2_wrt_L1", extrinR_L2_wrt_L1, vector<double>());
+        this->get_parameter_or<string>("common.imu_topic2", imu_topic2, "");
+        this->get_parameter_or<double>("common.time_offset_lidar_to_imu2", time_diff_lidar_to_imu2, 0.0);
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_T_L2_wrt_I2", extrinT_L2_wrt_I2, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_R_L2_wrt_I2", extrinR_L2_wrt_I2, vector<double>());
+        use_imu2 = !imu_topic2.empty() && (multi_lidar || passive_secondary);
+        if (!imu_topic2.empty() && !use_imu2)
+            RCLCPP_WARN(this->get_logger(), "common.imu_topic2 is set but multi-lidar is disabled — ignoring it");
         if (multi_lidar)
             RCLCPP_INFO(this->get_logger(), "Multi-LiDAR mode ENABLED (%s). L1: %s, L2: %s",
                         update_mode == 1 ? "ASYNC" : "BUNDLE", lid_topic.c_str(), lid_topic2.c_str());
@@ -1390,6 +1474,18 @@ public:
                 l2_extrinsic_resolved = true;
                 RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 translation: " << Lidar2_T_wrt_L1.transpose());
                 RCLCPP_INFO_STREAM(this->get_logger(), "L2 wrt L1 rotation:\n" << Lidar2_R_wrt_L1);
+            }
+            if (use_imu2)
+            {
+                if (extrinT_L2_wrt_I2.size() < 3 || extrinR_L2_wrt_I2.size() < 9)
+                {
+                    extrinT_L2_wrt_I2 = extrinT;
+                    extrinR_L2_wrt_I2 = extrinR;
+                    RCLCPP_INFO(this->get_logger(),
+                        "extrinsic_T/R_L2_wrt_I2 not set — using extrinsic_T/R (identical sensor hardware assumed)");
+                }
+                if (l2_extrinsic_resolved)
+                    enable_secondary_imu();  // otherwise enabled once the TF lookup resolves
             }
         }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
@@ -1464,6 +1560,18 @@ public:
         sub_options.callback_group = imu_cbg_;
 
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sub_options);
+
+        if (use_imu2)
+        {
+            imu2_cbg_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+            rclcpp::SubscriptionOptions imu2_sub_options;
+            imu2_sub_options.qos_overriding_options = qos_options;
+            imu2_sub_options.callback_group = imu2_cbg_;
+            sub_imu2_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic2, 10, imu_cbk2, imu2_sub_options);
+            RCLCPP_INFO(this->get_logger(),
+                "Secondary IMU subscriber created for topic: %s — L2 will be undistorted with its own IMU",
+                imu_topic2.c_str());
+        }
 
         if (use_odom_anchor_) {
             rclcpp::SubscriptionOptions odom_sub_options;
@@ -1967,11 +2075,16 @@ private:
             if ((multi_lidar || passive_secondary) && scan_pub_en) {
                 if ((multi_lidar && update_mode == 0) || passive_secondary) { // bundle mode
                     publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort_L1, lidar_frame);
-                    publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2,
-                        Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
+                    if (use_imu2)  // L2 output is already in its native frame
+                        publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2);
+                    else
+                        publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2,
+                            Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
                 } else { // async mode (multi_lidar only)
                     if (last_async_lidar == 1)
                         publish_frame_lidar_for(pubLaserCloud_L1_, feats_undistort, lidar_frame);
+                    else if (p_imu->hasL2Snapshot())  // native-frame copy from the secondary-IMU path
+                        publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort_L2, lidar_frame2);
                     else
                         publish_frame_lidar_for(pubLaserCloud_L2_, feats_undistort, lidar_frame2,
                             Lidar2_R_wrt_L1.transpose(), Lidar2_T_wrt_L1);
@@ -2003,26 +2116,48 @@ private:
                     });
                 }
                 if (current_full_cloud_L2 && !current_full_cloud_L2->empty()) {
-                    auto traj   = p_imu->captureTrajectory();
                     auto cloud  = current_full_cloud_L2;
                     auto pub    = pubUndistortedL2_;
                     auto frame2 = lidar_frame2;
-                    M3D R_L2_inv = Lidar2_R_wrt_L1.transpose();
-                    V3D T_L2     = Lidar2_T_wrt_L1;
-                    auto stamp   = scan_stamp;
-                    full_cloud_future_L2_ = std::async(std::launch::async, [traj, cloud, pub, frame2, R_L2_inv, T_L2, stamp]() {
-                        traj.applyTo(*cloud);
-                        // Back-transform from L1 frame to L2 frame
-                        for (auto& pt : cloud->points) {
-                            V3D p_L2 = R_L2_inv * (V3D(pt.x, pt.y, pt.z) - T_L2);
-                            pt.x = p_L2(0); pt.y = p_L2(1); pt.z = p_L2(2);
-                        }
-                        sensor_msgs::msg::PointCloud2 ros_msg;
-                        pcl::toROSMsg(*cloud, ros_msg);
-                        ros_msg.header.stamp = stamp;
-                        ros_msg.header.frame_id = frame2;
-                        pub->publish(ros_msg);
-                    });
+                    auto stamp  = scan_stamp;
+                    if (p_imu->hasL2Snapshot()) {
+                        // Secondary-IMU path: the full-res cloud is in the native L2 frame already
+                        auto l2_traj = p_imu->captureL2Trajectory();
+                        full_cloud_future_L2_ = std::async(std::launch::async, [l2_traj, cloud, pub, frame2, stamp]() {
+                            l2_traj.applyTo(*cloud);
+                            sensor_msgs::msg::PointCloud2 ros_msg;
+                            pcl::toROSMsg(*cloud, ros_msg);
+                            ros_msg.header.stamp = stamp;
+                            ros_msg.header.frame_id = frame2;
+                            pub->publish(ros_msg);
+                        });
+                    } else {
+                        auto traj = p_imu->captureTrajectory();
+                        M3D R_L2_inv = Lidar2_R_wrt_L1.transpose();
+                        V3D T_L2     = Lidar2_T_wrt_L1;
+                        // Secondary-IMU fallback: the cloud arrives in the native L2 frame and must
+                        // first be transformed to L1 where the primary trajectory applies.
+                        bool to_l1_first = use_imu2;
+                        full_cloud_future_L2_ = std::async(std::launch::async, [traj, cloud, pub, frame2, R_L2_inv, T_L2, to_l1_first, stamp]() {
+                            if (to_l1_first) {
+                                for (auto& pt : cloud->points) {
+                                    V3D p_L1 = R_L2_inv.transpose() * V3D(pt.x, pt.y, pt.z) + T_L2;
+                                    pt.x = p_L1(0); pt.y = p_L1(1); pt.z = p_L1(2);
+                                }
+                            }
+                            traj.applyTo(*cloud);
+                            // Back-transform from L1 frame to L2 frame
+                            for (auto& pt : cloud->points) {
+                                V3D p_L2 = R_L2_inv * (V3D(pt.x, pt.y, pt.z) - T_L2);
+                                pt.x = p_L2(0); pt.y = p_L2(1); pt.z = p_L2(2);
+                            }
+                            sensor_msgs::msg::PointCloud2 ros_msg;
+                            pcl::toROSMsg(*cloud, ros_msg);
+                            ros_msg.header.stamp = stamp;
+                            ros_msg.header.frame_id = frame2;
+                            pub->publish(ros_msg);
+                        });
+                    }
                 }
             } else {
                 if (current_full_cloud_L1 && !current_full_cloud_L1->empty()) {
@@ -2218,6 +2353,8 @@ private:
         imu_buffer.clear();
         time_buffer2.clear();
         lidar_buffer2.clear();
+        imu_buffer2.clear();
+        last_timestamp_imu2 = -1.0;
         full_lidar_buffer.clear();
         full_lidar_buffer2.clear();
         current_full_cloud_L1.reset();
@@ -2330,6 +2467,7 @@ private:
             Eigen::Isometry3d eigen_tf = tf2::transformToEigen(T_L1_to_L2.transform);
             Lidar2_R_wrt_L1 = eigen_tf.rotation();
             Lidar2_T_wrt_L1 = eigen_tf.translation();
+            if (use_imu2) enable_secondary_imu();
             l2_extrinsic_resolved = true;
             tf_init_timer_->cancel();
             RCLCPP_INFO(this->get_logger(), "L2 extrinsic from TF (%s -> %s) resolved!",
@@ -2361,6 +2499,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu2_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -2380,6 +2519,7 @@ private:
     rclcpp::CallbackGroup::SharedPtr lidar1_cbg_;
     rclcpp::CallbackGroup::SharedPtr lidar2_cbg_;
     rclcpp::CallbackGroup::SharedPtr imu_cbg_;
+    rclcpp::CallbackGroup::SharedPtr imu2_cbg_;
     rclcpp::CallbackGroup::SharedPtr odom_cbg_;
     rclcpp::TimerBase::SharedPtr tf_init_timer_;
     // Futures declared AFTER publishers so they are destroyed FIRST, ensuring async tasks
