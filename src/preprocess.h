@@ -17,8 +17,8 @@ enum LID_TYPE
   VELODYNE,          // velodyne_ros::Point (x,y,z,intensity,time,ring)
   OUSTER,            // ouster_ros::Point (x,y,z,intensity,t,reflectivity,ring,ambient,range)
   XYZRTL,            // livox_ros::LivoxPointXyzrtl (x,y,z,reflectivity,tag,line — no per-point time)
-  XYZRTLO_AVIA,      // pcl::PointXYZRO + Avia scan-line grouping & duplicate filtering
-  XYZRTLO            // pcl::PointXYZRO, simple (offset_time used directly)
+  XYZRTLO_AVIA,      // x,y,z,intensity,tag,ring,time (configurable field names) + Avia scan-line grouping & duplicate filtering
+  XYZRTLO            // x,y,z,intensity,tag,ring,time (configurable field names), simple (t used directly)
 };
 enum TIME_UNIT
 {
@@ -134,28 +134,6 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (uint8_t, line, line)
 )
 
-namespace pcl
-{
-typedef struct {
-  float x;            /**< X axis, Unit:m */
-  float y;            /**< Y axis, Unit:m */
-  float z;            /**< Z axis, Unit:m */
-  uint8_t reflectivity; /**< Reflectivity   */
-  uint8_t tag;        /**< Livox point tag   */
-  uint8_t line;       /**< Laser line id     */
-  uint32_t offset_time;
-} PointXYZRO;
-}
-POINT_CLOUD_REGISTER_POINT_STRUCT(pcl::PointXYZRO,
-    (float, x, x)
-    (float, y, y)
-    (float, z, z)
-    (uint8_t, reflectivity, reflectivity)
-    (uint8_t, tag, tag)
-    (uint8_t, line, line)
-    (uint32_t, offset_time, offset_time)
-)
-
 class Preprocess
 {
   public:
@@ -178,7 +156,32 @@ class Preprocess
   bool feature_enabled, given_offset_time, self_filtered;
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
+  // Configurable PointCloud2 field names for the XYZRTLO / XYZRTLO_AVIA handlers, since different
+  // Livox PointCloud2 drivers/configs may publish these under different field names
+  // (e.g. custom_pc2_intensity_field/custom_pc2_tag_field/custom_pc2_ring_field/custom_pc2_time_field
+  // in athena_livox_driver.yaml).
+  std::string field_name_intensity = "intensity";
+  std::string field_name_tag = "tag";
+  std::string field_name_ring = "ring";
+  std::string field_name_time = "t";
+
 private:
+  struct PointFieldInfo
+  {
+    int offset = -1;
+    uint8_t datatype = 0;
+  };
+  struct XyzrtloFieldLayout
+  {
+    PointFieldInfo intensity, tag, ring, time;
+    bool valid = false;
+  };
+
+  XyzrtloFieldLayout lookupXyzrtloFieldLayout(const sensor_msgs::msg::PointCloud2 &msg);
+  static PointFieldInfo findField(const sensor_msgs::msg::PointCloud2 &msg, const std::string &name);
+  template <typename T>
+  static T readFieldValue(const uint8_t *point_data, const PointFieldInfo &info);
+
   void livox_custom_handler(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr &msg);
   void xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void ouster_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);

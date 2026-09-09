@@ -1,9 +1,78 @@
 #include "preprocess.h"
 
 #include <pcl/common/common.h>
+#include <sensor_msgs/msg/point_field.hpp>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
+
+Preprocess::PointFieldInfo Preprocess::findField(const sensor_msgs::msg::PointCloud2 &msg, const std::string &name)
+{
+  PointFieldInfo info;
+  for (const auto &field : msg.fields)
+  {
+    if (field.name == name)
+    {
+      info.offset = field.offset;
+      info.datatype = field.datatype;
+      return info;
+    }
+  }
+  return info;
+}
+
+template <typename T>
+T Preprocess::readFieldValue(const uint8_t *point_data, const PointFieldInfo &info)
+{
+  const uint8_t *field_data = point_data + info.offset;
+  switch (info.datatype)
+  {
+    case sensor_msgs::msg::PointField::INT8:
+      return static_cast<T>(*reinterpret_cast<const int8_t *>(field_data));
+    case sensor_msgs::msg::PointField::UINT8:
+      return static_cast<T>(*reinterpret_cast<const uint8_t *>(field_data));
+    case sensor_msgs::msg::PointField::INT16:
+      return static_cast<T>(*reinterpret_cast<const int16_t *>(field_data));
+    case sensor_msgs::msg::PointField::UINT16:
+      return static_cast<T>(*reinterpret_cast<const uint16_t *>(field_data));
+    case sensor_msgs::msg::PointField::INT32:
+      return static_cast<T>(*reinterpret_cast<const int32_t *>(field_data));
+    case sensor_msgs::msg::PointField::UINT32:
+      return static_cast<T>(*reinterpret_cast<const uint32_t *>(field_data));
+    case sensor_msgs::msg::PointField::FLOAT32:
+      return static_cast<T>(*reinterpret_cast<const float *>(field_data));
+    case sensor_msgs::msg::PointField::FLOAT64:
+      return static_cast<T>(*reinterpret_cast<const double *>(field_data));
+    default:
+      return T(0);
+  }
+}
+
+Preprocess::XyzrtloFieldLayout Preprocess::lookupXyzrtloFieldLayout(const sensor_msgs::msg::PointCloud2 &msg)
+{
+  XyzrtloFieldLayout layout;
+  layout.intensity = findField(msg, field_name_intensity);
+  layout.tag = findField(msg, field_name_tag);
+  layout.ring = findField(msg, field_name_ring);
+  layout.time = findField(msg, field_name_time);
+
+  std::vector<std::pair<const char *, const PointFieldInfo *>> required = {
+      {field_name_intensity.c_str(), &layout.intensity},
+      {field_name_tag.c_str(), &layout.tag},
+      {field_name_ring.c_str(), &layout.ring},
+      {field_name_time.c_str(), &layout.time},
+  };
+  layout.valid = true;
+  for (const auto &req : required)
+  {
+    if (req.second->offset < 0)
+    {
+      RCLCPP_ERROR(rclcpp::get_logger("FAST_LIO"), "PointCloud2 is missing configured field \"%s\"", req.first);
+      layout.valid = false;
+    }
+  }
+  return layout;
+}
 
 Preprocess::Preprocess() : feature_enabled(0), lidar_type(LIVOX_CUSTOM), blind(0.01), point_filter_num(1), self_filtered(false)
 {
@@ -560,12 +629,20 @@ void Preprocess::xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::Const
   pl_corn.clear();
   pl_full.clear();
   double t1 = omp_get_wtime();
-  
-  pcl::PointCloud<pcl::PointXYZRO> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+
+  XyzrtloFieldLayout layout = lookupXyzrtloFieldLayout(*msg);
+  if (!layout.valid)
+    return;
+  PointFieldInfo x_field = findField(*msg, "x");
+  PointFieldInfo y_field = findField(*msg, "y");
+  PointFieldInfo z_field = findField(*msg, "z");
+
+  int plsize = msg->width * msg->height;
   if (plsize == 0)
     return;
+  const uint8_t *cloud_data = msg->data.data();
+  const size_t point_step = msg->point_step;
+  auto point_at = [&](uint i) { return cloud_data + i * point_step; };
 
   pl_corn.reserve(plsize);
   pl_surf.reserve(plsize);
@@ -582,21 +659,23 @@ void Preprocess::xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::Const
   {
     for (uint i = 1; i < plsize; i++)
     {
-      if ((pl_orig.points[i].line < N_SCANS) &&
-          ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00))
+      const uint8_t *pt = point_at(i);
+      uint16_t ring = readFieldValue<uint16_t>(pt, layout.ring);
+      uint8_t tag = readFieldValue<uint8_t>(pt, layout.tag);
+      if ((ring < N_SCANS) && ((tag & 0x30) == 0x10 || (tag & 0x30) == 0x00))
       {
-        pl_full[i].x = pl_orig.points[i].x;
-        pl_full[i].y = pl_orig.points[i].y;
-        pl_full[i].z = pl_orig.points[i].z;
-        pl_full[i].intensity = pl_orig.points[i].reflectivity;
+        pl_full[i].x = readFieldValue<float>(pt, x_field);
+        pl_full[i].y = readFieldValue<float>(pt, y_field);
+        pl_full[i].z = readFieldValue<float>(pt, z_field);
+        pl_full[i].intensity = readFieldValue<float>(pt, layout.intensity);
         pl_full[i].curvature =
-            pl_orig.points[i].offset_time / float(1000000);  // use curvature as time of each laser points
+            readFieldValue<double>(pt, layout.time) / float(1000000);  // use curvature as time of each laser points
 
         bool is_new = false;
         if ((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7) || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7) ||
             (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
         {
-          pl_buff[pl_orig.points[i].line].push_back(pl_full[i]);
+          pl_buff[ring].push_back(pl_full[i]);
         }
       }
     }
@@ -633,17 +712,19 @@ void Preprocess::xyzrtlo_avia_handler(const sensor_msgs::msg::PointCloud2::Const
   {
     for (uint i = 1; i < plsize; i++)
     {
-      if ((pl_orig.points[i].line < N_SCANS) &&
-          ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00))
+      const uint8_t *pt = point_at(i);
+      uint16_t ring = readFieldValue<uint16_t>(pt, layout.ring);
+      uint8_t tag = readFieldValue<uint8_t>(pt, layout.tag);
+      if ((ring < N_SCANS) && ((tag & 0x30) == 0x10 || (tag & 0x30) == 0x00))
       {
         valid_num++;
         if (valid_num % point_filter_num == 0)
         {
-          pl_full[i].x = pl_orig.points[i].x;
-          pl_full[i].y = pl_orig.points[i].y;
-          pl_full[i].z = pl_orig.points[i].z;
-          pl_full[i].intensity = pl_orig.points[i].reflectivity;
-          pl_full[i].curvature = pl_orig.points[i].offset_time /
+          pl_full[i].x = readFieldValue<float>(pt, x_field);
+          pl_full[i].y = readFieldValue<float>(pt, y_field);
+          pl_full[i].z = readFieldValue<float>(pt, z_field);
+          pl_full[i].intensity = readFieldValue<float>(pt, layout.intensity);
+          pl_full[i].curvature = readFieldValue<double>(pt, layout.time) /
                                  float(1000000);  // use curvature as time of each laser points, curvature unit: ms
 
           if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7)
@@ -665,29 +746,38 @@ void Preprocess::xyzrtlo_handler(const sensor_msgs::msg::PointCloud2::ConstShare
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZRO> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  XyzrtloFieldLayout layout = lookupXyzrtloFieldLayout(*msg);
+  if (!layout.valid)
+    return;
+  PointFieldInfo x_field = findField(*msg, "x");
+  PointFieldInfo y_field = findField(*msg, "y");
+  PointFieldInfo z_field = findField(*msg, "z");
+
+  int plsize = msg->width * msg->height;
   if (plsize == 0)
     return;
+  const uint8_t *cloud_data = msg->data.data();
+  const size_t point_step = msg->point_step;
 
   pl_surf.reserve(plsize);
   uint valid_num = 0;
 
   for (uint i = 0; i < plsize; i++)
   {
-    if ((pl_orig.points[i].tag & 0x30) == 0x10 || (pl_orig.points[i].tag & 0x30) == 0x00)
+    const uint8_t *pt = cloud_data + i * point_step;
+    uint8_t tag = readFieldValue<uint8_t>(pt, layout.tag);
+    if ((tag & 0x30) == 0x10 || (tag & 0x30) == 0x00)
     {
       valid_num++;
       if (valid_num % point_filter_num != 0)
         continue;
 
       PointType added_pt;
-      added_pt.x = pl_orig.points[i].x;
-      added_pt.y = pl_orig.points[i].y;
-      added_pt.z = pl_orig.points[i].z;
-      added_pt.intensity = pl_orig.points[i].reflectivity;
-      added_pt.curvature = pl_orig.points[i].offset_time / float(1000000);  // ns -> ms
+      added_pt.x = readFieldValue<float>(pt, x_field);
+      added_pt.y = readFieldValue<float>(pt, y_field);
+      added_pt.z = readFieldValue<float>(pt, z_field);
+      added_pt.intensity = readFieldValue<float>(pt, layout.intensity);
+      added_pt.curvature = readFieldValue<double>(pt, layout.time) / float(1000000);  // ns -> ms
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;

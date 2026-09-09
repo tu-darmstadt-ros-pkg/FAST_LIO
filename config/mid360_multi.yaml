@@ -36,6 +36,14 @@
             timestamp_unit2: 3
             scan_rate: 10                    # only for velodyne, unit: Hz
             scan_rate2: 10
+            field_name_intensity: "intensity"
+            field_name_tag: "tag"
+            field_name_ring: "ring"
+            field_name_time: "t"
+            field_name_intensity2: "intensity"
+            field_name_tag2: "tag"
+            field_name_ring2: "ring"
+            field_name_time2: "t"
 
         mapping:
             acc_cov: 0.15
